@@ -1,6 +1,8 @@
 import json
 import uuid
 import asyncio
+import re
+from datetime import datetime
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -15,6 +17,16 @@ from core.utils.util import remove_punctuation_and_length
 from core.providers.tts.dto.dto import TTSMessageDTO, SentenceType
 
 TAG = __name__
+
+
+PLATE_QUERY_PATTERN = re.compile(
+    r"查询\s*(?P<location>[\u4e00-\u9fa5A-Za-z0-9_-]+)\s*(?P<date>\d{4}年\d{1,2}月\d{1,2}日)\s*记录.*车牌号"
+)
+
+
+def _normalize_cn_date(date_text: str) -> str:
+    date_text = date_text.replace("年", "-").replace("月", "-").replace("日", "")
+    return datetime.strptime(date_text, "%Y-%m-%d").strftime("%Y-%m-%d")
 
 
 async def handle_user_intent(conn: "ConnectionHandler", text):
@@ -37,6 +49,10 @@ async def handle_user_intent(conn: "ConnectionHandler", text):
     if await checkWakeupWords(conn, filtered_text):
         return True
 
+    # 固定语义直达查询：查询{地点}{日期}记录有多少车牌号信息
+    if await try_handle_plate_records_query(conn, filtered_text, text):
+        return True
+
     if conn.intent_type == "function_call":
         # 使用支持function calling的聊天方法,不再进行意图分析
         return False
@@ -48,6 +64,73 @@ async def handle_user_intent(conn: "ConnectionHandler", text):
     conn.sentence_id = str(uuid.uuid4().hex)
     # 处理各种意图
     return await process_intent_result(conn, intent_result, text)
+
+
+async def try_handle_plate_records_query(
+    conn: "ConnectionHandler", filtered_text: str, original_text: str
+):
+    match = PLATE_QUERY_PATTERN.search(filtered_text)
+    if not match:
+        return False
+
+    location = match.group("location")
+    date_text = match.group("date")
+    try:
+        normalized_date = _normalize_cn_date(date_text)
+    except ValueError:
+        return False
+
+    if not hasattr(conn, "func_handler") or conn.func_handler is None:
+        return False
+    if not conn.func_handler.has_tool("query_plate_records"):
+        return False
+
+    await send_stt_message(conn, original_text)
+    conn.client_abort = False
+    conn.sentence_id = str(uuid.uuid4().hex)
+
+    function_args = {"location": location, "date": normalized_date}
+    function_call_data = {
+        "name": "query_plate_records",
+        "id": str(uuid.uuid4().hex),
+        "arguments": json.dumps(function_args, ensure_ascii=False),
+    }
+
+    enqueue_tool_report(conn, "query_plate_records", function_args)
+
+    def process_plate_query_call():
+        conn.dialogue.put(Message(role="user", content=original_text))
+        tool_call_timeout = int(conn.config.get("tool_call_timeout", 30))
+
+        try:
+            result = asyncio.run_coroutine_threadsafe(
+                conn.func_handler.handle_llm_function_call(conn, function_call_data),
+                conn.loop,
+            ).result(timeout=tool_call_timeout)
+        except Exception as e:
+            conn.logger.bind(tag=TAG).error(f"query_plate_records 调用失败: {e}")
+            result = ActionResponse(
+                action=Action.ERROR,
+                result="查询超时，请稍后重试。",
+                response="查询超时，请稍后重试。",
+            )
+
+        enqueue_tool_report(
+            conn,
+            "query_plate_records",
+            function_args,
+            str(result.result) if result and result.result else None,
+            report_tool_call=False,
+        )
+
+        if not result:
+            return
+        text = result.response if result.response else result.result
+        if text is not None:
+            speak_txt(conn, text)
+
+    conn.executor.submit(process_plate_query_call)
+    return True
 
 
 async def check_direct_exit(conn: "ConnectionHandler", text):

@@ -184,6 +184,13 @@ plugins:
     max_results: 5
     # 秘塔API Key（mk-前缀） / Tavily API Key（tvly-前缀）
     api_key: "mk-xxx"
+  query_plate_records:
+    # 外部查询接口，参考 iot-smart_home/test/test_data_analysis.py
+    api_url: "https://dmap.cscec3bxjy.cn/api/dibang/report/workerstatus"
+    timeout: 30
+    default_project_id: "sanyuanli"
+    location_project_map:
+      三元里: "sanyuanli"
 # 声纹识别配置
 voiceprint:
   # 声纹接口地址
@@ -269,6 +276,7 @@ Intent:
       - web_search
       - get_weather
       - get_news_from_newsnow
+      - query_plate_records
       - play_music
   function_call:
     # 不需要动type
@@ -280,6 +288,7 @@ Intent:
       - change_role
       - web_search                  # 联网搜索
       - get_weather
+      - query_plate_records
       # - search_from_ragflow
       # - get_news_from_chinanews
       - get_news_from_newsnow
