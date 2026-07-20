@@ -117,7 +117,7 @@ async def main():
     project = resolve_project(args)
 
     check_ffmpeg_installed()
-    config = load_config()
+    config = await load_config()
 
     # ---- 注入项目配置 ----
     config["project"] = project
