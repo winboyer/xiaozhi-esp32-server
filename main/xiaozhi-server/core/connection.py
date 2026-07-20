@@ -35,7 +35,11 @@ from core.providers.tools.unified_tool_handler import UnifiedToolHandler
 from plugins_func.loadplugins import auto_import_modules
 from plugins_func.register import Action, ActionResponse
 from core.auth import AuthenticationError
-from config.config_loader import get_private_config_from_api
+from config.config_loader import (
+    get_private_config_from_api,
+    _llm_module_names_match,
+    _resolve_llm_config_entry,
+)
 from core.providers.tts.dto.dto import ContentType, TTSMessageDTO, SentenceType
 from config.logger import setup_logging, build_module_string, create_connection_logger
 from config.manage_api_client import DeviceNotFoundException, DeviceBindException, generate_and_save_chat_title
@@ -43,6 +47,7 @@ from core.utils.prompt_manager import PromptManager
 from core.utils.voiceprint_provider import VoiceprintProvider
 from core.utils.util import get_system_error_response
 from core.utils import textUtils
+from core.project_config import apply_project_filter
 
 
 TAG = __name__
@@ -189,6 +194,9 @@ class ConnectionHandler:
 
         # 初始化提示词管理器
         self.prompt_manager = PromptManager(self.config, self.logger)
+
+        # 潮白河项目: 监测数据库查询引擎（非潮白河项目为 None）
+        self._chaobaihe_db_engine = None
 
     async def handle_connection(self, ws: websockets.ServerConnection):
         try:
@@ -525,6 +533,8 @@ class ConnectionHandler:
             self._init_prompt_enhancement()
             """注入工具调用few-shot示例（仅function_call模式）"""
             self._inject_tool_call_fewshot()
+            """应用项目配置过滤（根据启动时指定的项目名称，过滤可用工具）"""
+            apply_project_filter(self)
 
         except Exception as e:
             self.logger.bind(tag=TAG).error(f"实例化组件失败: {e}")
@@ -684,8 +694,15 @@ class ConnectionHandler:
                 self.headers.get("client-id", self.headers.get("device-id")),
             )
             private_config["delete_audio"] = bool(self.config.get("delete_audio", True))
+            safe_private_config = filter_sensitive_info(private_config)
+            selected_module = safe_private_config.get("selected_module", {})
+            summary = {
+                "selected_module": selected_module,
+                "keys": sorted(list(safe_private_config.keys())),
+                "plugins_count": len(safe_private_config.get("plugins", {}) or {}),
+            }
             self.logger.bind(tag=TAG).info(
-                f"{time.time() - begin_time} 秒，异步获取差异化配置成功: {json.dumps(filter_sensitive_info(private_config), ensure_ascii=False)}"
+                f"{time.time() - begin_time} 秒，异步获取差异化配置成功: {json.dumps(summary, ensure_ascii=False)}"
             )
             self.need_bind = False
             self.bind_completed_event.set()
@@ -728,11 +745,74 @@ class ConnectionHandler:
                 "TTS"
             ]
         if private_config.get("LLM", None) is not None:
-            init_llm = True
-            self.config["LLM"] = private_config["LLM"]
-            self.config["selected_module"]["LLM"] = private_config["selected_module"][
-                "LLM"
-            ]
+            # 验证 api_key 不是占位符，防止无效配置覆盖本地有效配置
+            remote_llm = private_config.get("LLM", {})
+            remote_selected_raw = private_config.get("selected_module", {}).get("LLM", "")
+            remote_selected, remote_llm_cfg = _resolve_llm_config_entry(
+                remote_llm, remote_selected_raw
+            )
+            remote_api_key = remote_llm_cfg.get("api_key", "")
+            
+            remote_key_valid = (
+                remote_api_key
+                and "你" not in str(remote_api_key)
+                and "your" not in str(remote_api_key).lower()
+            )
+            
+            if remote_key_valid:
+                # 检查远程模型是否与当前配置一致
+                local_selected_raw = self.config.get("selected_module", {}).get("LLM", "")
+                local_selected, local_llm_cfg = _resolve_llm_config_entry(
+                    self.config.get("LLM", {}), local_selected_raw
+                )
+                local_key = local_llm_cfg.get("api_key", "")
+                local_valid = (
+                    local_selected
+                    and local_key
+                    and "你" not in str(local_key)
+                    and "your" not in str(local_key).lower()
+                )
+                
+                should_use_remote = True
+                
+                if local_valid and not _llm_module_names_match(local_selected, remote_selected):
+                    # 远程模型与本地配置不一致，保留本地配置
+                    self.logger.bind(tag=TAG).info(
+                        f"管理端 LLM ({remote_selected_raw or remote_selected}) 与本地配置 ({local_selected_raw or local_selected}) 不一致，"
+                        f"保留本地配置"
+                    )
+                    should_use_remote = False
+                elif local_valid and _llm_module_names_match(local_selected, remote_selected):
+                    # 模型名称一致时，验证 URL 域名是否与本地一致
+                    from urllib.parse import urlparse
+                    remote_url = remote_llm_cfg.get("url") or remote_llm_cfg.get("base_url", "")
+                    local_url = local_llm_cfg.get("url") or local_llm_cfg.get("base_url", "")
+                    if remote_url and local_url:
+                        remote_domain = urlparse(remote_url).netloc
+                        local_domain = urlparse(local_url).netloc
+                        if remote_domain and local_domain and remote_domain != local_domain:
+                            self.logger.bind(tag=TAG).info(
+                                f"管理端 LLM URL 域名 ({remote_domain}) 与本地 ({local_domain}) 不一致，"
+                                f"管理端数据可能过期，保留本地配置"
+                            )
+                            should_use_remote = False
+                
+                if should_use_remote:
+                    # 远程模型与本地一致且 URL 一致，或本地无效，使用远程配置
+                    init_llm = True
+                    self.config["LLM"] = remote_llm
+                    self.config["selected_module"]["LLM"] = remote_selected
+                    self.logger.bind(tag=TAG).info(
+                        f"从管理端加载有效 LLM 配置: {remote_selected} (model: {remote_llm_cfg.get('model_name', 'unknown')})"
+                    )
+                else:
+                    init_llm = False
+            else:
+                self.logger.bind(tag=TAG).warning(
+                    f"管理端 LLM 配置 ({remote_selected}) 的 api_key 为占位符，"
+                    f"将保留本地配置 {self.config['selected_module'].get('LLM', 'unknown')}"
+                )
+                init_llm = False
         if private_config.get("VLLM", None) is not None:
             self.config["VLLM"] = private_config["VLLM"]
             self.config["selected_module"]["VLLM"] = private_config["selected_module"][
@@ -749,6 +829,18 @@ class ConnectionHandler:
             self.config["Intent"] = private_config["Intent"]
             model_intent = private_config.get("selected_module", {}).get("Intent", {})
             self.config["selected_module"]["Intent"] = model_intent
+
+            # 对齐 intent_llm 与主 LLM，避免意图链路切到非预期模型
+            intent_cfg = self.config["Intent"].get(model_intent, {})
+            if isinstance(intent_cfg, dict) and intent_cfg.get("type") == "intent_llm":
+                intent_llm_name = intent_cfg.get("llm", "")
+                selected_llm = self.config.get("selected_module", {}).get("LLM", "")
+                if selected_llm and intent_llm_name and not _llm_module_names_match(intent_llm_name, selected_llm):
+                    self.logger.bind(tag=TAG).info(
+                        f"管理端 intent_llm ({intent_llm_name}) 与主 LLM ({selected_llm}) 不一致，已同步为主 LLM"
+                    )
+                    intent_cfg["llm"] = selected_llm
+
             # 加载插件配置
             if model_intent != "Intent_nointent":
                 plugin_from_server = private_config.get("plugins", {})
@@ -894,6 +986,10 @@ class ConnectionHandler:
                 # 否则使用主LLM
                 self.intent.set_llm(self.llm)
                 self.logger.bind(tag=TAG).info("使用主LLM作为意图识别模型")
+        elif intent_type == "function_call":
+            # function_call 模式也需要设置 intent.llm，供 staff_safe_query 等工具函数调用
+            self.intent.set_llm(self.llm)
+            self.logger.bind(tag=TAG).info("function_call 模式：设置 intent.llm 为主 LLM")
 
         """加载统一工具处理器"""
         self.func_handler = UnifiedToolHandler(self)

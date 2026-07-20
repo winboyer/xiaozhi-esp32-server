@@ -1,5 +1,6 @@
 import os
 import sys
+import errno
 from loguru import logger
 from config.config_loader import load_config
 from config.settings import check_config_file
@@ -7,6 +8,20 @@ from datetime import datetime
 
 SERVER_VERSION = "0.9.3"
 _logger_initialized = False
+
+
+def _safe_console_sink(message):
+    """Write logs to stdout without letting non-blocking IO errors break business flow."""
+    try:
+        sys.stdout.write(str(message))
+        sys.stdout.flush()
+    except BlockingIOError:
+        # EAGAIN / EWOULDBLOCK on non-blocking stdout
+        return
+    except OSError as e:
+        if e.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+            return
+        raise
 
 
 def get_module_abbreviation(module_name, module_dict):
@@ -52,6 +67,13 @@ def setup_logging():
     log_config = config["log"]
     global _logger_initialized
 
+    # 强制设置 stdout 为 UTF-8 编码，避免 Docker/非UTF8 环境下中文日志抛出 ascii codec 异常
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    else:
+        import io
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+
     # 第一次初始化时配置日志
     if not _logger_initialized:
         # 使用默认的模块字符串进行初始化
@@ -83,8 +105,16 @@ def setup_logging():
         # 配置日志输出
         logger.remove()
 
-        # 输出到控制台
-        logger.add(sys.stdout, format=log_format, level=log_level, filter=formatter)
+        # 输出到控制台（容错处理，避免非阻塞stdout导致业务初始化中断）
+        logger.add(
+            _safe_console_sink,
+            format=log_format,
+            level=log_level,
+            filter=formatter,
+            enqueue=True,
+            backtrace=False,
+            diagnose=False,
+        )
 
         # 输出到文件 - 统一目录，按大小轮转
         # 日志文件完整路径

@@ -1,0 +1,52 @@
+# requirements.lock — 依赖版本锁定
+# 生成时间: 2026-06-18
+# 说明: 此文件锁定所有依赖的具体版本，确保跨机器环境一致性
+# 更新方式: pip freeze > .harness/environment/requirements.lock
+
+# === 核心 WebSocket 框架 ===
+websockets==13.1
+
+# === 异步支持 ===
+aiohttp==3.10.10
+aiofiles==24.1.0
+
+# === YAML 配置 ===
+pyyaml==6.0.2
+omegaconf==2.3.0
+
+# === HTTP 客户端 ===
+requests==2.32.3
+httpx==0.28.1
+
+# === LLM 客户端 ===
+openai==1.58.0
+tiktoken==0.8.0
+
+# === 语音处理 ===
+pyaudio==0.2.14
+opuslib==3.0.1
+numpy==2.2.0
+
+# === 工具库 ===
+python-dotenv==1.0.1
+colorama==0.4.6
+
+# === 日志 ===
+loguru==0.7.2
+
+# === 时间处理 ===
+python-dateutil==2.9.0.post0
+pytz==2024.2
+
+# === 网络工具 ===
+urllib3==2.2.3
+certifi==2024.8.30
+idna==3.10
+
+# === 类型注解 ===
+typing-extensions==4.12.2
+
+# === 开发/测试（可选） ===
+# pytest==8.3.4
+# pytest-asyncio==0.24.0
+# pylint==3.3.1

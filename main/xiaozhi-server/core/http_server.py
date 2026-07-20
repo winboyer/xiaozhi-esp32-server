@@ -3,6 +3,7 @@ from aiohttp import web
 from config.logger import setup_logging
 from core.api.ota_handler import OTAHandler
 from core.api.vision_handler import VisionHandler
+from core.api.staff_safe_handler import StaffSafeHandler
 
 TAG = __name__
 
@@ -13,6 +14,7 @@ class SimpleHttpServer:
         self.logger = setup_logging()
         self.ota_handler = OTAHandler(config)
         self.vision_handler = VisionHandler(config)
+        self.staff_safe_handler = StaffSafeHandler(config)
 
     def _get_websocket_url(self, local_ip: str, port: int) -> str:
         """获取websocket地址
@@ -71,6 +73,23 @@ class SimpleHttpServer:
                         ),
                         web.options(
                             "/mcp/vision/explain", self.vision_handler.handle_options
+                        ),
+                        # 工地安全数据查询接口
+                        web.get(
+                            "/staff-safe/status",
+                            self.staff_safe_handler.handle_status,
+                        ),
+                        web.options(
+                            "/staff-safe/status",
+                            self.staff_safe_handler.handle_options,
+                        ),
+                        web.post(
+                            "/staff-safe/query",
+                            self.staff_safe_handler.handle_query,
+                        ),
+                        web.options(
+                            "/staff-safe/query",
+                            self.staff_safe_handler.handle_options,
                         ),
                     ]
                 )

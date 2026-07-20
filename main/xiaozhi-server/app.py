@@ -1,7 +1,27 @@
+"""
+小智 AI 服务主入口
+
+支持启动参数：
+    --project / -p : 项目名称，指定后启用对应项目的数据查询能力
+                     不指定则为普通 LLM 对话服务（无数据接口/数据库调用）
+
+支持的项目：
+    三元里 - 人员状态（定位）+ 地磅数据分析
+    将军祠 - 施工数据接口（设备/进度/人员/塔机/车牌等）
+    潮白河 - 监测数据库查询（测缝计/GNSS/渗压计/流量计等）
+
+示例：
+    python app.py                        # 普通 LLM 对话模式
+    python app.py --project 三元里       # 三元里项目模式
+    python app.py -p 将军祠              # 将军祠项目模式
+    python app.py -p 潮白河              # 潮白河项目模式
+"""
+
 import sys
 import uuid
 import signal
 import asyncio
+import argparse
 from aioconsole import ainput
 from config.settings import load_config
 from config.logger import setup_logging
@@ -10,9 +30,33 @@ from core.http_server import SimpleHttpServer
 from core.websocket_server import WebSocketServer
 from core.utils.util import check_ffmpeg_installed
 from core.utils.gc_manager import get_gc_manager
+from core.project_config import ProjectName, PROJECT_DESCRIPTIONS
 
 TAG = __name__
 logger = setup_logging()
+
+
+def parse_args() -> argparse.Namespace:
+    """解析命令行参数"""
+    parser = argparse.ArgumentParser(
+        description="小智 AI 服务 - 支持多项目数据查询",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "支持的项目名称:\n"
+            f"  三元里    - {PROJECT_DESCRIPTIONS.get(ProjectName.SANYUANLI, '')}\n"
+            f"  将军祠    - {PROJECT_DESCRIPTIONS.get(ProjectName.JIANGJUNCI, '')}\n"
+            f"  潮白河    - {PROJECT_DESCRIPTIONS.get(ProjectName.CHAOBAIHE, '')}\n"
+            "\n不指定 --project 时，启动普通 LLM 对话服务（不进行数据接口/数据库调用）。"
+        ),
+    )
+    parser.add_argument(
+        "--project", "-p",
+        type=str,
+        default=None,
+        metavar="NAME",
+        help=f"项目名称: {' / '.join(sorted(ProjectName.all_values()))}",
+    )
+    return parser.parse_args()
 
 
 async def wait_for_exit() -> None:
@@ -43,9 +87,40 @@ async def monitor_stdin():
         await ainput()  # 异步等待输入，消费回车
 
 
+def resolve_project(args: argparse.Namespace) -> ProjectName | None:
+    """解析并验证项目名称
+    
+    Returns:
+        ProjectName 枚举值，无项目或验证失败返回 None
+    """
+    if not args.project:
+        return None
+    
+    project = ProjectName.from_string(args.project)
+    if project is None:
+        logger.bind(tag=TAG).error(
+            f"不支持的项目名称: '{args.project}'，"
+            f"支持: {ProjectName.choices_help()}"
+        )
+        logger.bind(tag=TAG).info(
+            "将以普通 LLM 对话模式启动。"
+            "如需指定项目，请使用 --project 参数并输入正确的项目名称。"
+        )
+        return None
+    
+    return project
+
+
 async def main():
+    # ---- 解析命令行参数 ----
+    args = parse_args()
+    project = resolve_project(args)
+
     check_ffmpeg_installed()
     config = load_config()
+
+    # ---- 注入项目配置 ----
+    config["project"] = project
 
     # auth_key优先级：配置文件server.auth_key > manager-api.secret > 自动生成
     # auth_key用于jwt认证，比如视觉分析接口的jwt认证、ota接口的token生成与websocket认证
@@ -60,6 +135,17 @@ async def main():
             auth_key = str(uuid.uuid4().hex)
     
     config["server"]["auth_key"] = auth_key
+
+    # ---- 启动信息日志 ----
+    if project is not None:
+        desc = PROJECT_DESCRIPTIONS.get(project, "未知项目")
+        logger.bind(tag=TAG).info("=" * 60)
+        logger.bind(tag=TAG).info(f"  项目模式: {project.value} ({desc})")
+        logger.bind(tag=TAG).info("=" * 60)
+    else:
+        logger.bind(tag=TAG).info("=" * 60)
+        logger.bind(tag=TAG).info("  普通 LLM 对话模式（无数据接口/数据库调用）")
+        logger.bind(tag=TAG).info("=" * 60)
 
     # 添加 stdin 监控任务
     stdin_task = asyncio.create_task(monitor_stdin())
@@ -150,3 +236,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         print("手动中断，程序终止。")
+

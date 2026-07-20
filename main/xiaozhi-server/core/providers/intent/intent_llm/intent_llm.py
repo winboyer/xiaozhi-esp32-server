@@ -10,6 +10,10 @@ import re
 import json
 import hashlib
 import time
+from datetime import datetime, timedelta
+
+# 动态技能提示注册中心
+from plugins_func.skills.registry import skill_registry
 
 
 
@@ -31,7 +35,9 @@ class IntentProvider(IntentProviderBase):
 
     def get_intent_system_prompt(self, functions_list: str) -> str:
         """
-        根据配置的意图选项和可用函数动态生成系统提示词
+        根据配置的意图选项和可用函数动态生成系统提示词。
+        技能相关的关键词匹配规则和 few-shot 示例从 skill_registry 动态收集，
+        不再硬编码在意图识别模块中。
         Args:
             functions: 可用的函数列表，JSON格式字符串
         Returns:
@@ -58,6 +64,35 @@ class IntentProvider(IntentProviderBase):
 
             functions_desc += "---\n"
 
+        # 动态计算今天、昨天和上周最后一天的最后时刻，用于 few-shot 示例
+        now = datetime.now()
+        today_end = now.strftime("%Y-%m-%d") + " 23:59:59"
+        yesterday_end = (now - timedelta(days=1)).strftime("%Y-%m-%d") + " 23:59:59"
+        last_week_end = (now - timedelta(days=now.weekday() + 1)).strftime("%Y-%m-%d") + " 23:59:59"
+
+        # ---- 动态收集技能提示 ----
+        keyword_table = skill_registry.build_keyword_table()
+        few_shot_examples = skill_registry.build_few_shot_examples()
+
+        # 仅当存在技能提示时才显示关键词匹配规则
+        keyword_section = ""
+        if keyword_table:
+            keyword_section = (
+                "【关键词模糊匹配规则】如果用户输入中包含以下关键词或词组，请直接匹配对应的函数，无需精确匹配句式：\n"
+                + keyword_table
+                + "\n\n"
+            )
+
+        # 仅当存在 few-shot 示例时才显示示例部分
+        few_shot_section = ""
+        if few_shot_examples:
+            few_shot_section = (
+                "【技能匹配示例】\n"
+                + few_shot_examples
+                + "\n\n"
+            )
+
+        # 构建提示词（base 部分保持稳定，skill 部分动态注入）
         prompt = (
             "【严格格式要求】你必须只能返回JSON格式，绝对不能返回任何自然语言！\n\n"
             "你是一个意图识别助手。请分析用户的最后一句话，判断用户意图并调用相应的函数。\n\n"
@@ -65,14 +100,18 @@ class IntentProvider(IntentProviderBase):
             "- 询问当前时间（如：现在几点、当前时间、查询时间等）\n"
             "- 询问今天日期（如：今天几号、今天星期几、今天是什么日期等）\n"
             "- 询问今天农历（如：今天农历几号、今天什么节气等）\n"
-            "- 询问所在城市（如：我现在在哪里、你知道我在哪个城市吗等）"
-            "系统会根据上下文信息直接构建回答。\n\n"
+            "- 询问所在城市（如：我现在在哪里、你知道我在哪个城市吗等）\n"
+            "- 系统会根据上下文信息直接构建回答。\n\n"
             "- 如果用户使用疑问词（如'怎么'、'为什么'、'如何'）询问退出相关的问题（例如'怎么退出了？'），注意这不是让你退出，请返回 {'function_call': {'name': 'continue_chat'}\n"
             "- 仅当用户明确使用'退出系统'、'结束对话'、'我不想和你说话了'等指令时，才触发 handle_exit_intent\n\n"
+            f"当前时间参考：今天是 {now.strftime('%Y-%m-%d')}，当前时间是 {now.strftime('%H:%M:%S')}。\n"
+            f"今天截止时间为 {today_end}，昨天截止时间为 {yesterday_end}，上周最后一天截止时间为 {last_week_end}。\n\n"
             f"{functions_desc}\n"
+            f"{keyword_section}"
+            f"{few_shot_section}"
             "处理步骤:\n"
-            "1. 分析用户输入，确定用户意图\n"
-            "2. 检查是否为上述基础信息查询（时间、日期等），如是则返回result_for_context\n"
+            "1. 先用关键词模糊匹配规则检查用户输入，命中则直接调用对应函数\n"
+            "2. 再检查是否为上述基础信息查询（时间、日期等），如是则返回result_for_context\n"
             "3. 从可用函数列表中选择最匹配的函数\n"
             "4. 如果找到匹配的函数，生成对应的function_call 格式\n"
             '5. 如果没有找到匹配的函数，返回{"function_call": {"name": "continue_chat"}}\n\n'
@@ -81,7 +120,7 @@ class IntentProvider(IntentProviderBase):
             "2. 必须包含function_call字段\n"
             "3. function_call必须包含name字段\n"
             "4. 如果函数需要参数，必须包含arguments字段\n\n"
-            "示例：\n"
+            "基础示例：\n"
             "```\n"
             "用户: 现在几点了？\n"
             '返回: {"function_call": {"name": "result_for_context"}}\n'
@@ -119,6 +158,49 @@ class IntentProvider(IntentProviderBase):
             "【最终警告】绝对禁止输出任何自然语言、表情符号或解释文字！只能输出有效JSON格式！违反此规则将导致系统错误！"
         )
         return prompt
+
+    def reply_result_with_skill_summary(
+        self, text: str, original_text: str, function_name: str = None
+    ):
+        """
+        使用技能特定的摘要提示词生成回复（用于 REQLLM 模式）。
+        当函数返回 Action.REQLLM 时，使用注册的 summary_prompt 指导 LLM 生成总结。
+
+        Args:
+            text: 函数返回的原始数据（用作 data 占位符填充）
+            original_text: 用户原始输入
+            function_name: 触发的函数名，用于查找对应的 summary_prompt
+        """
+        try:
+            # 尝试获取技能特定的摘要提示词
+            summary_prompt = skill_registry.get_summary_prompt(function_name) if function_name else None
+
+            if summary_prompt and "{data}" in summary_prompt:
+                # 有自定义摘要提示词，用数据填充
+                formatted_prompt = summary_prompt.replace("{data}", text)
+            else:
+                # 回退到通用摘要提示词
+                formatted_prompt = (
+                    "你是一个智能数据助手。请根据以下查询结果，用口语化、简洁的语言回复用户的问题。\n\n"
+                    f"用户的问题：{original_text}\n\n"
+                    f"查询结果数据：\n{text}\n\n"
+                    "要求：\n"
+                    "1. 用自然的口语描述数据情况，像人类汇报一样\n"
+                    "2. 突出关键数字和信息\n"
+                    "3. 回复长度控制在50-150字\n"
+                    "4. 不要使用任何 Markdown 格式\n"
+                    "5. 不要添加「根据数据分析」等套话\n\n"
+                    "请直接返回总结文本："
+                )
+
+            llm_result = self.llm.response_no_stream(
+                system_prompt=formatted_prompt,
+                user_prompt=original_text,
+            )
+            return llm_result
+        except Exception as e:
+            logger.bind(tag=TAG).error(f"Error in generating skill summary: {e}")
+            return get_system_error_response(self.config)
 
     def replyResult(self, text: str, original_text: str):
         try:

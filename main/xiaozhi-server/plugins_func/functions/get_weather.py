@@ -5,6 +5,11 @@ from plugins_func.register import register_function, ToolType, ActionResponse, A
 from core.utils.util import get_ip_info
 from typing import TYPE_CHECKING
 
+# 注册天气技能提示，帮助 LLM 更准确地匹配天气查询意图
+from plugins_func.skills.weather_skill import register_weather_skill
+
+register_weather_skill()
+
 if TYPE_CHECKING:
     from core.connection import ConnectionHandler
 

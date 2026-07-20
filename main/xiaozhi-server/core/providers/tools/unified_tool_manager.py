@@ -64,19 +64,41 @@ class ToolManager:
         tools = self.get_all_tools()
         return tool_name in tools
 
+    def _normalize_tool_name(self, name: str) -> str:
+        """标准化工具名：移除下划线并转为小写，用于模糊匹配"""
+        return name.replace("_", "").replace("-", "").lower()
+
     def get_tool_type(self, tool_name: str) -> Optional[ToolType]:
         """获取工具类型"""
         tools = self.get_all_tools()
         tool_def = tools.get(tool_name)
         return tool_def.tool_type if tool_def else None
 
+    def _fuzzy_find_tool(self, tool_name: str) -> Optional[str]:
+        """模糊匹配工具名，当精确匹配失败时，尝试移除下划线等字符后匹配"""
+        tools = self.get_all_tools()
+        normalized_input = self._normalize_tool_name(tool_name)
+        for name in tools:
+            if self._normalize_tool_name(name) == normalized_input:
+                self.logger.info(
+                    f"模糊匹配工具名: 输入 '{tool_name}' -> 匹配到 '{name}'"
+                )
+                return name
+        return None
+
     async def execute_tool(
         self, tool_name: str, arguments: Dict[str, Any]
     ) -> ActionResponse:
         """执行工具调用"""
         try:
-            # 查找工具类型
+            # 查找工具类型（先精确匹配，再模糊匹配）
             tool_type = self.get_tool_type(tool_name)
+            if not tool_type:
+                # 模糊匹配：LLM 可能漏掉下划线（如 analyzeweighbridgedata -> analyze_weighbridge_data）
+                matched_name = self._fuzzy_find_tool(tool_name)
+                if matched_name:
+                    tool_name = matched_name
+                    tool_type = self.get_tool_type(tool_name)
             if not tool_type:
                 return ActionResponse(
                     action=Action.NOTFOUND,

@@ -2,6 +2,7 @@ import os
 import asyncio
 import yaml
 from collections.abc import Mapping
+from urllib.parse import urlparse
 from config.manage_api_client import (
     init_service,
     get_server_config,
@@ -61,8 +62,54 @@ def load_config():
     return config
 
 
-async def get_config_from_api_async(config):
-    """从Java API获取配置（异步版本）"""
+def _load_local_config_from_disk():
+    """直接从磁盘加载本地 config.yaml，用于 manager-api 配置缺失时的回退"""
+    local_path = os.path.join(get_project_dir(), "config.yaml")
+    if os.path.exists(local_path):
+        try:
+            return yaml.safe_load(open(local_path, "r", encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
+
+
+def _normalize_llm_module_name(name):
+    """把管理端和本地配置里的 LLM 名称归一化到同一比较口径。"""
+    if not name:
+        return ""
+    name = str(name).strip()
+    return name[4:] if name.startswith("LLM_") else name
+
+
+def _resolve_llm_config_entry(llm_configs, selected_name):
+    """根据 selected_name 在 LLM 配置字典里找到实际条目。"""
+    if not isinstance(llm_configs, Mapping):
+        return "", {}
+
+    if selected_name in llm_configs and isinstance(llm_configs[selected_name], dict):
+        return selected_name, llm_configs[selected_name]
+
+    normalized_selected = _normalize_llm_module_name(selected_name)
+    if not normalized_selected:
+        return "", {}
+
+    for name, cfg in llm_configs.items():
+        if isinstance(cfg, dict) and _normalize_llm_module_name(name) == normalized_selected:
+            return name, cfg
+
+    return "", {}
+
+
+def _llm_module_names_match(left, right):
+    return _normalize_llm_module_name(left) == _normalize_llm_module_name(right)
+
+
+async def get_config_from_api_async(config, default_config=None):
+    """从Java API获取配置（异步版本）
+    
+    如果管理端返回的 LLM 配置缺失或无效（api_key 为占位符），
+    则参照 staff_safe_handler 的方式直接从磁盘读取本地 config.yaml 回退。
+    """
     # 初始化API客户端
     init_service(config)
 
@@ -90,6 +137,126 @@ async def get_config_from_api_async(config):
     # 如果服务器没有prompt_template，则从本地配置读取
     if not config_data.get("prompt_template"):
         config_data["prompt_template"] = config.get("prompt_template")
+
+    # ---- 验证管理端 LLM 配置 ----
+    # 参照 staff_safe_handler 的回退策略：
+    # 如果管理端返回的 LLM 配置缺失或 api_key 无效，直接从磁盘读取本地 config.yaml
+    remote_selected_raw = config_data.get("selected_module", {}).get("LLM", "")
+    remote_selected, remote_llm_cfg = _resolve_llm_config_entry(
+        config_data.get("LLM", {}), remote_selected_raw
+    )
+    if remote_selected and remote_selected != remote_selected_raw:
+        config_data["selected_module"]["LLM"] = remote_selected
+    remote_api_key = remote_llm_cfg.get("api_key", "")
+
+    invalid_key = (
+        not remote_api_key
+        or "你" in str(remote_api_key)
+        or "your" in str(remote_api_key).lower()
+    )
+
+    should_fallback = invalid_key
+    fallback_reason = "api_key 无效"
+
+    # 即使远程 api_key 有效，如果本地 config.yaml 里配置了不同的模型且有有效凭据，
+    # 也应优先使用本地配置（与 staff_safe_handler 行为一致）
+    if not should_fallback:
+        local_cfg = _load_local_config_from_disk()
+        local_selected_raw = local_cfg.get("selected_module", {}).get("LLM", "")
+        local_selected, local_llm_cfg = _resolve_llm_config_entry(
+            local_cfg.get("LLM", {}), local_selected_raw
+        )
+        local_key = local_llm_cfg.get("api_key", "")
+        local_valid = (
+            local_selected
+            and local_key
+            and "你" not in str(local_key)
+            and "your" not in str(local_key).lower()
+        )
+        if local_valid and not _llm_module_names_match(local_selected, remote_selected):
+            should_fallback = True
+            fallback_reason = (
+                f"远程模型 ({remote_selected_raw or remote_selected}) 与本地配置 "
+                f"({local_selected_raw or local_selected}) 不一致"
+            )
+        elif local_valid and _llm_module_names_match(local_selected, remote_selected):
+            # 模型名称一致时，验证远程 URL 域名是否与本地一致
+            # 管理端可能存储了旧的/错误的 URL（如指向 bigmodel.cn 的 DeepSeekLLM）
+            remote_url = remote_llm_cfg.get("url") or remote_llm_cfg.get("base_url", "")
+            local_url = local_llm_cfg.get("url") or local_llm_cfg.get("base_url", "")
+            if remote_url and local_url:
+                remote_domain = urlparse(remote_url).netloc
+                local_domain = urlparse(local_url).netloc
+                if remote_domain and local_domain and remote_domain != local_domain:
+                    should_fallback = True
+                    fallback_reason = f"远程 URL 域名 ({remote_domain}) 与本地 ({local_domain}) 不一致，管理端数据可能过期"
+
+    if should_fallback:
+        # 直接从磁盘加载本地 config.yaml（与 staff_safe_handler 行为一致）
+        local_cfg = _load_local_config_from_disk()
+        local_llm = local_cfg.get("LLM", {})
+        local_selected_raw = local_cfg.get("selected_module", {}).get("LLM", "")
+        local_selected, _ = _resolve_llm_config_entry(local_llm, local_selected_raw)
+        fallback_llm = None
+        fallback_selected = None
+
+        if local_selected and local_llm.get(local_selected):
+            fb_key = local_llm[local_selected].get("api_key", "")
+            if fb_key and "你" not in str(fb_key) and "your" not in str(fb_key).lower():
+                fallback_llm = local_llm
+                fallback_selected = local_selected
+                fallback_source = f"本地 config.yaml → {local_selected}"
+
+        # 如果 selected_module 里指定的没效，遍历所有 LLM 取第一个有效的
+        if fallback_llm is None:
+            for name, cfg in local_llm.items():
+                if (
+                    isinstance(cfg, dict)
+                    and cfg.get("api_key")
+                    and "你" not in str(cfg.get("api_key", ""))
+                    and "your" not in str(cfg.get("api_key", "")).lower()
+                ):
+                    fallback_llm = local_llm
+                    fallback_selected = name
+                    fallback_source = f"本地 config.yaml → {name}"
+                    break
+
+        if fallback_llm and fallback_selected:
+            config_data["LLM"] = fallback_llm
+            config_data["selected_module"]["LLM"] = fallback_selected
+            # 同步更新 Intent.intent_llm.llm（如果远程也设置了且不一致）
+            intent_llm_remote = (
+                config_data.get("Intent", {}).get("intent_llm", {}).get("llm", "")
+            )
+            if intent_llm_remote and intent_llm_remote != fallback_selected:
+                if "Intent" not in config_data:
+                    config_data["Intent"] = {}
+                if "intent_llm" not in config_data["Intent"]:
+                    config_data["Intent"]["intent_llm"] = {}
+                config_data["Intent"]["intent_llm"]["llm"] = fallback_selected
+            print(
+                f"[config] 管理端 LLM ({remote_selected_raw or remote_selected}) {fallback_reason}，"
+                f"回退到 {fallback_source}"
+            )
+        else:
+            print(
+                f"[config] 管理端 LLM ({remote_selected_raw or remote_selected}) {fallback_reason}，"
+                f"且本地 config.yaml 中无可用回退配置"
+            )
+
+    # 统一意图识别使用的 llm，避免管理端历史配置把 intent_llm 切到其他提供商
+    selected_llm = config_data.get("selected_module", {}).get("LLM", "")
+    intent_selected = config_data.get("selected_module", {}).get("Intent", "")
+    intent_cfg = config_data.get("Intent", {}).get(intent_selected, {})
+    if isinstance(intent_cfg, dict) and intent_cfg.get("type") == "intent_llm":
+        intent_llm_name = intent_cfg.get("llm", "")
+        if selected_llm and intent_llm_name and not _llm_module_names_match(intent_llm_name, selected_llm):
+            intent_cfg["llm"] = selected_llm
+            print(
+                f"[config] 管理端 intent_llm ({intent_llm_name}) 与当前主 LLM ({selected_llm}) 不一致，"
+                f"已同步为主 LLM"
+            )
+
     return config_data
 
 

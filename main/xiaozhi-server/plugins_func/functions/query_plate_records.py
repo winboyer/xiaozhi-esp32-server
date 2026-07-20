@@ -1,4 +1,5 @@
 import re
+import json
 from datetime import datetime
 from typing import Any, Dict, List
 
@@ -9,6 +10,11 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from core.connection import ConnectionHandler
+
+# 注册车牌记录技能提示
+from plugins_func.skills.plate_records_skill import register_plate_records_skill
+
+register_plate_records_skill()
 
 TAG = __name__
 logger = setup_logging()
@@ -134,9 +140,10 @@ def query_plate_records(conn: "ConnectionHandler", location: str = None, date: s
     except ValueError as e:
         return ActionResponse(Action.RESPONSE, response=f"日期格式错误：{e}")
 
+    # 外部 API 只支持 week 模式，day 模式会返回 400
     payload = {
         "project_id": project_id,
-        "query_type": "day",
+        "query_type": "week",
         "end_time": f"{normalized_date} 23:59:59",
     }
 
@@ -146,14 +153,32 @@ def query_plate_records(conn: "ConnectionHandler", location: str = None, date: s
 
     try:
         resp = requests.post(api_url, json=payload, timeout=timeout)
-        resp.raise_for_status()
+        if not resp.ok:
+            # 记录非200响应的详细内容，便于排查400等错误
+            resp_body = resp.text[:500] if resp.text else ""
+            logger.bind(tag=TAG).error(
+                f"query_plate_records API返回错误 | status={resp.status_code} "
+                f"url={api_url} payload={payload} response={resp_body}"
+            )
+            return ActionResponse(
+                Action.RESPONSE,
+                response=f"查询失败，接口返回 {resp.status_code} 错误。",
+            )
         data = resp.json()
 
         plate_count = _extract_plate_count(data)
-        response_text = (
-            f"{location}{normalized_date}记录到{plate_count}条车牌号信息。"
+
+        # 返回原始数据给 LLM 做智能总结（REQLLM 模式）
+        raw_data = json.dumps(
+            {
+                "location": location,
+                "date": normalized_date,
+                "plate_count": plate_count,
+            },
+            ensure_ascii=False,
+            indent=2,
         )
-        return ActionResponse(Action.RESPONSE, result=response_text, response=response_text)
+        return ActionResponse(Action.REQLLM, result=raw_data, response=None)
     except requests.exceptions.Timeout:
         return ActionResponse(Action.RESPONSE, response="查询超时，请稍后再试。")
     except requests.exceptions.RequestException as e:

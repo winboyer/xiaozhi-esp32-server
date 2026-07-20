@@ -240,7 +240,7 @@ CREATE DATABASE xiaozhi_esp32_server CHARACTER SET utf8mb4 COLLATE utf8mb4_unico
 如果还没有MySQL，你可以通过docker安装mysql
 
 ```
-docker run --name xiaozhi-esp32-server-db -e MYSQL_ROOT_PASSWORD=123456 -p 3306:3306 -e MYSQL_DATABASE=xiaozhi_esp32_server -e MYSQL_INITDB_ARGS="--character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci" -e TZ=Asia/Shanghai -d mysql:latest
+docker run --name xiaozhi-esp32-server-db -e MYSQL_ROOT_PASSWORD=123456 -p 3306:3306 -e MYSQL_DATABASE=xiaozhi_esp32_server -e MYSQL_INITDB_ARGS="--character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci" -e TZ=Asia/Shanghai -d docker.m.daocloud.io/library/mysql:latest
 ```
 
 ## 2.安装redis
@@ -248,7 +248,7 @@ docker run --name xiaozhi-esp32-server-db -e MYSQL_ROOT_PASSWORD=123456 -p 3306:
 如果还没有Redis，你可以通过docker安装redis
 
 ```
-docker run --name xiaozhi-esp32-server-redis -d -p 6379:6379 redis
+docker run --name xiaozhi-esp32-server-redis -d -p 6379:6379 docker.m.daocloud.io/library/redis:8.0
 ```
 
 ## 3.运行manager-api程序

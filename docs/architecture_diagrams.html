@@ -1,0 +1,413 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>小智语音交互智能体 - 核心架构图</title>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    <style>
+        :root {
+            --bg: #f0f2f5;
+            --card-bg: #ffffff;
+            --text: #1a1a2e;
+            --text-secondary: #555;
+            --border: #e0e0e0;
+            --accent: #4f46e5;
+            --accent-light: #eef2ff;
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            line-height: 1.6;
+            padding: 24px;
+        }
+        .container { max-width: 1400px; margin: 0 auto; }
+        h1 {
+            text-align: center;
+            font-size: 28px;
+            font-weight: 700;
+            margin-bottom: 8px;
+            background: linear-gradient(135deg, #4f46e5, #7c3aed);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+        .subtitle { text-align: center; color: var(--text-secondary); margin-bottom: 32px; font-size: 14px; }
+        .diagram-section {
+            background: var(--card-bg);
+            border-radius: 16px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.06), 0 4px 16px rgba(0,0,0,0.04);
+            padding: 32px 24px;
+            margin-bottom: 32px;
+        }
+        .diagram-title {
+            font-size: 20px;
+            font-weight: 700;
+            margin-bottom: 8px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .diagram-title .icon { font-size: 24px; }
+        .diagram-desc {
+            color: var(--text-secondary);
+            font-size: 14px;
+            margin-bottom: 24px;
+            padding-bottom: 16px;
+            border-bottom: 1px solid var(--border);
+        }
+        .mermaid {
+            display: flex;
+            justify-content: center;
+            overflow-x: auto;
+            padding: 16px 0;
+        }
+        .legend {
+            display: flex;
+            gap: 20px;
+            flex-wrap: wrap;
+            justify-content: center;
+            margin-top: 20px;
+            padding-top: 16px;
+            border-top: 1px solid var(--border);
+        }
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 12px;
+            color: var(--text-secondary);
+        }
+        .legend-dot {
+            width: 12px;
+            height: 12px;
+            border-radius: 3px;
+        }
+        .toc {
+            display: flex;
+            gap: 12px;
+            justify-content: center;
+            margin-bottom: 24px;
+            flex-wrap: wrap;
+        }
+        .toc a {
+            text-decoration: none;
+            color: var(--accent);
+            background: var(--accent-light);
+            padding: 6px 16px;
+            border-radius: 20px;
+            font-size: 13px;
+            font-weight: 500;
+            transition: all 0.2s;
+        }
+        .toc a:hover { background: var(--accent); color: #fff; }
+    </style>
+</head>
+<body>
+<div class="container">
+    <h1>🏠 小智语音交互智能体 - 核心架构图</h1>
+    <p class="subtitle">基于 xiaozhi-esp32-server 项目 | 语音交互智能体的完整处理链路与系统架构</p>
+
+    <nav class="toc">
+        <a href="#diagram1">📊 核心处理逻辑结构图</a>
+        <a href="#diagram2">🏗️ 数据查询+设备控制业务架构图</a>
+    </nav>
+
+    <!-- ============ 图一：核心处理逻辑结构图 ============ -->
+    <div id="diagram1" class="diagram-section">
+        <div class="diagram-title">
+            <span class="icon">📊</span> 图一：语音交互智能体核心处理逻辑结构图
+        </div>
+        <p class="diagram-desc">
+            展示从语音输入到语音输出的完整端到端处理管线，包括音频采集、VAD/ASR、意图识别、LLM对话、工具调用、TTS合成等关键模块。
+        </p>
+        <div class="mermaid">
+graph TB
+    subgraph DEVICE["📱 ESP32 智能设备端"]
+        MIC["🎤 麦克风采集"]
+        SPK["🔊 扬声器播放"]
+        WS_CLIENT["WebSocket 客户端"]
+    end
+
+    subgraph SERVER["🖥️ xiaozhi-server 服务端"]
+        subgraph AUDIO_PIPELINE["━━━ 音频处理管线 ━━━"]
+            VAD["🔇 VAD<br/>语音活动检测<br/>receiveAudioHandle.py"]
+            ASR["📝 ASR<br/>语音识别<br/>将音频转为文本"]
+        end
+
+        subgraph TEXT_PIPELINE["━━━ 文本处理管线 ━━━"]
+            WAKEWORD["🔔 唤醒词检测<br/>checkWakeupWords"]
+            EXIT_CHECK["👋 退出命令检查<br/>check_direct_exit"]
+            INTENT_LLM["🧠 意图识别 LLM<br/>intent_llm.py<br/>分析用户意图 → function_call"]
+        end
+
+        subgraph CHAT_PIPELINE["━━━ 对话处理管线 ━━━"]
+            MAIN_LLM["💬 主对话 LLM<br/>connection.py chat()<br/>流式对话 + function_call"]
+            MEMORY["🧩 记忆模块<br/>Memory（短期/长期）<br/>对话历史总结"]
+        end
+
+        subgraph TOOL_SYSTEM["━━━ 统一工具调用系统 ━━━"]
+            TOOL_MGR["🔧 统一工具管理器<br/>ToolManager"]
+            SERVER_PLUGIN["📦 服务端插件<br/>地磅/人员/车牌"]
+            HASS_TOOLS["🏠 Home Assistant<br/>设备状态/控制"]
+            DEVICE_IOT["📡 设备端 IoT<br/>iot_executor.py"]
+            SERVER_MCP["🔌 MCP 服务端"]
+            MCP_ENDPOINT["🌐 MCP 接入点"]
+        end
+
+        subgraph OUTPUT_PIPELINE["━━━ 输出管线 ━━━"]
+            TTS["🗣️ TTS 语音合成<br/>文本 → 音频"]
+            OUTPUT_CTRL["📤 输出控制<br/>speak_txt / send_stt"]
+        end
+    end
+
+    subgraph EXTERNAL["🌍 外部服务"]
+        API_DIBANG["地磅数据 API<br/>dmap.cscec3bxjy.cn"]
+        API_OTHER["人员/车牌 API"]
+        HASS_API["Home Assistant API<br/>灯光/空调/窗帘..."]
+    end
+
+    %% 主流程连接
+    MIC --> WS_CLIENT
+    WS_CLIENT -->|"WebSocket<br/>音频流"| VAD
+    VAD -->|"have_voice=True"| ASR
+    ASR -->|"识别文本"| WAKEWORD
+    WAKEWORD --> EXIT_CHECK
+    EXIT_CHECK -->|"非退出/非唤醒"| INTENT_LLM
+    INTENT_LLM -->|"function_call<br/>（数据查询/设备控制）"| TOOL_MGR
+    INTENT_LLM -->|"无匹配工具<br/>continue_chat"| MAIN_LLM
+    MAIN_LLM <-->|"对话记忆"| MEMORY
+
+    TOOL_MGR --> SERVER_PLUGIN
+    TOOL_MGR --> HASS_TOOLS
+    TOOL_MGR --> DEVICE_IOT
+    TOOL_MGR --> SERVER_MCP
+    TOOL_MGR --> MCP_ENDPOINT
+
+    SERVER_PLUGIN -->|"HTTP 请求"| API_DIBANG
+    SERVER_PLUGIN -->|"HTTP 请求"| API_OTHER
+    HASS_TOOLS -->|"REST API"| HASS_API
+
+    SERVER_PLUGIN -->|"Action.REQLLM<br/>结构化数据"| MAIN_LLM
+    HASS_TOOLS -->|"Action.REQLLM<br/>设备状态"| MAIN_LLM
+
+    MAIN_LLM -->|"文本回复"| TTS
+    TTS -->|"TTSMessageDTO"| OUTPUT_CTRL
+    OUTPUT_CTRL -->|"音频数据"| WS_CLIENT
+    WS_CLIENT --> SPK
+
+    %% 样式
+    classDef device fill:#e0f2fe,stroke:#0284c7,stroke-width:2px,color:#0c4a6e
+    classDef audio fill:#fef3c7,stroke:#f59e0b,stroke-width:2px,color:#78350f
+    classDef text fill:#dbeafe,stroke:#3b82f6,stroke-width:2px,color:#1e3a5f
+    classDef chat fill:#ede9fe,stroke:#8b5cf6,stroke-width:2px,color:#3b0764
+    classDef tool fill:#dcfce7,stroke:#22c55e,stroke-width:2px,color:#14532d
+    classDef output fill:#ffe4e6,stroke:#f43f5e,stroke-width:2px,color:#881337
+    classDef external fill:#f3f4f6,stroke:#9ca3af,stroke-width:2px,color:#374151
+
+    class MIC,SPK,WS_CLIENT device
+    class VAD,ASR audio
+    class WAKEWORD,EXIT_CHECK,INTENT_LLM text
+    class MAIN_LLM,MEMORY chat
+    class TOOL_MGR,SERVER_PLUGIN,HASS_TOOLS,DEVICE_IOT,SERVER_MCP,MCP_ENDPOINT tool
+    class TTS,OUTPUT_CTRL output
+    class API_DIBANG,API_OTHER,HASS_API external
+        </div>
+
+        <div class="legend">
+            <div class="legend-item"><span class="legend-dot" style="background:#0284c7;"></span> ESP32 设备端</div>
+            <div class="legend-item"><span class="legend-dot" style="background:#f59e0b;"></span> 音频处理管线</div>
+            <div class="legend-item"><span class="legend-dot" style="background:#3b82f6;"></span> 文本处理管线</div>
+            <div class="legend-item"><span class="legend-dot" style="background:#8b5cf6;"></span> 对话处理管线</div>
+            <div class="legend-item"><span class="legend-dot" style="background:#22c55e;"></span> 工具调用系统</div>
+            <div class="legend-item"><span class="legend-dot" style="background:#f43f5e;"></span> 输出管线</div>
+            <div class="legend-item"><span class="legend-dot" style="background:#9ca3af;"></span> 外部服务</div>
+        </div>
+
+        <details style="margin-top:20px; background:#f9fafb; border-radius:8px; padding:12px 16px;">
+            <summary style="font-weight:600; cursor:pointer; color:var(--accent);">📋 详细处理流程说明</summary>
+            <div style="margin-top:12px; font-size:13px; color:var(--text-secondary); line-height:1.8;">
+                <p><strong>1. 音频采集 → VAD 检测</strong>：ESP32 通过 WebSocket 发送音频流，服务端 VAD 模块检测是否有语音活动，过滤静音片段。设备刚被唤醒时短暂忽略 VAD（just_woken_up）。</p>
+                <p><strong>2. ASR 语音识别</strong>：识别后的文本可能包含说话人信息（JSON 格式 {speaker, content}），支持声纹识别区分用户。</p>
+                <p><strong>3. 唤醒词/退出检查</strong>：先检查是否为设备唤醒词或明确的退出命令（如"再见"）。</p>
+                <p><strong>4. 意图识别 LLM</strong>：专用 LLM 分析用户意图，判断是否匹配已注册的工具函数。匹配则输出 function_call JSON（含工具名+参数），不匹配则标记 continue_chat 进入普通对话。</p>
+                <p><strong>5. 工具调用</strong>：ToolManager 将 function_call 路由到对应执行器（服务端插件 / HASS / 设备 IoT 等），执行后返回 ActionResponse（RESPONSE 直接回复 / REQLLM 交由主 LLM 总结 / ERROR 错误处理）。</p>
+                <p><strong>6. 主 LLM 对话</strong>：支持流式输出、多轮记忆、工具递归调用（最大深度 5），通过 direct_answer 虚拟工具防止小模型误触发真实工具。</p>
+                <p><strong>7. TTS 合成输出</strong>：LLM 文本回复经 TTS 合成为音频，分句构建 TTSMessageDTO 队列，通过 WebSocket 回传设备播放。</p>
+            </div>
+        </details>
+    </div>
+
+    <!-- ============ 图二：数据查询+设备控制交互架构图（业务版） ============ -->
+    <div id="diagram2" class="diagram-section">
+        <div class="diagram-title">
+            <span class="icon">🏗️</span> 图二：智能语音交互 — 数据查询 + 设备控制业务架构图
+        </div>
+        <p class="diagram-desc">
+            面向业务人员的简化视图：用户通过自然语言说出需求，系统自动理解意图、调用对应业务能力、将结果以语音形式播报。
+        </p>
+        <div class="mermaid">
+graph LR
+    subgraph L1["━ 第①步：用户语音输入 ━"]
+        direction TB
+        U1["🔊 数据查询场景<br/>「三元里今天运了多少车？」<br/>「张三今天上班了吗？」<br/>「查一下粤A12345的进出记录」"]
+        U2["🔊 设备控制场景<br/>「把客厅灯打开」<br/>「空调调到26度」<br/>「开始播放音乐」"]
+    end
+
+    subgraph L2["━ 第②步：智能理解与调度 ━"]
+        direction TB
+        AI["🤖 AI 智能大脑<br/>━━━━━━━━━━━━━━━<br/>听懂用户想做什么<br/>自动判断是查数据还是控设备<br/>提取关键信息（时间/地点/操作）"]
+    end
+
+    subgraph L3["━ 第③步：业务能力执行 ━"]
+        subgraph L3A["📊 数据查询能力"]
+            direction TB
+            B1["地磅数据查询<br/>车次统计 / 重量分析<br/>每日趋势 / 车辆排名"]
+            B2["人员状态查询<br/>考勤记录 / 在岗人数<br/>请假统计"]
+            B3["车牌记录查询<br/>车辆进出记录<br/>通行时间 / 次数"]
+        end
+        subgraph L3B["🏠 设备控制能力"]
+            direction TB
+            B4["灯光控制<br/>开关 / 亮度 / 颜色"]
+            B5["空调/窗帘控制<br/>温度调节 / 开关"]
+            B6["影音娱乐<br/>音乐播放 / 暂停"]
+        end
+    end
+
+    subgraph L4["━ 第④步：数据来源 ━"]
+        B1 -.->|"获取数据"| DB1[("地磅管理系统<br/>过磅记录数据")]
+        B2 -.->|"获取数据"| DB2[("人员管理系统<br/>考勤打卡数据")]
+        B3 -.->|"获取数据"| DB3[("车牌识别系统<br/>车辆进出记录")]
+        B4 -.->|"发送指令"| H1[("智能家居平台<br/>Home Assistant")]
+        B5 -.->|"发送指令"| H1
+        B6 -.->|"发送指令"| H1
+    end
+
+    subgraph L5["━ 第⑤步：结果整理与播报 ━"]
+        direction TB
+        GEN["💬 AI 生成口语化回复<br/>━━━━━━━━━━━━━━━<br/>将查询结果整理成<br/>自然、简洁的语音播报"]
+        SPK_OUT["🔊 语音播报<br/>「三元里今天共运输 127 车次，<br/>总重 1850 吨，平均每车 14.6 吨」<br/>━━━━━━━━━━━━━━━<br/>「好的，客厅灯已打开」"]
+    end
+
+    U1 --> AI
+    U2 --> AI
+    AI -->|"查数据"| L3A
+    AI -->|"控设备"| L3B
+    GEN --> SPK_OUT
+
+    classDef input fill:#e0f2fe,stroke:#0284c7,stroke-width:2px,color:#0c4a6e
+    classDef brain fill:#ede9fe,stroke:#7c3aed,stroke-width:3px,color:#3b0764
+    classDef biz fill:#dcfce7,stroke:#22c55e,stroke-width:2px,color:#14532d
+    classDef db fill:#f3f4f6,stroke:#9ca3af,stroke-width:2px,color:#374151
+    classDef out fill:#fce7f3,stroke:#ec4899,stroke-width:2px,color:#831843
+
+    class U1,U2 input
+    class AI brain
+    class B1,B2,B3,B4,B5,B6 biz
+    class DB1,DB2,DB3,H1 db
+    class GEN,SPK_OUT out
+        </div>
+
+        <div class="legend">
+            <div class="legend-item"><span class="legend-dot" style="background:#0284c7;"></span> 用户输入</div>
+            <div class="legend-item"><span class="legend-dot" style="background:#7c3aed;"></span> AI 理解调度</div>
+            <div class="legend-item"><span class="legend-dot" style="background:#22c55e;"></span> 业务能力</div>
+            <div class="legend-item"><span class="legend-dot" style="background:#9ca3af;"></span> 数据来源</div>
+            <div class="legend-item"><span class="legend-dot" style="background:#ec4899;"></span> 结果播报</div>
+        </div>
+
+        <details style="margin-top:20px; background:#f9fafb; border-radius:8px; padding:12px 16px;">
+            <summary style="font-weight:600; cursor:pointer; color:var(--accent);">📋 业务流程说明（面向业务人员）</summary>
+            <div style="margin-top:12px; font-size:13px; color:var(--text-secondary); line-height:1.8;">
+
+                <p><strong>🔹 整体流程（5 步走）：</strong></p>
+                <ol style="padding-left:20px;">
+                    <li><strong>用户开口说话</strong> — 对着智能设备说出你想查什么、想控制什么，就像跟人聊天一样自然。</li>
+                    <li><strong>AI 大脑理解意图</strong> — 系统自动判断你是要查数据（地磅、人员、车牌）还是要控制设备（灯光、空调、音乐），并提取出关键信息（时间、地点、操作）。</li>
+                    <li><strong>调用对应的业务能力</strong> — 系统匹配到正确的功能后，去对应的系统获取数据或发送控制指令。</li>
+                    <li><strong>获取/执行结果</strong> — 从地磅系统取回过磅记录、从考勤系统取回打卡数据，或者向智能家居发送开关指令。</li>
+                    <li><strong>语音播报结果</strong> — AI 把获取到的数据整理成简洁易懂的口语，通过设备扬声器播放出来。</li>
+                </ol>
+
+                <p><strong>🔹 数据查询场景示例：</strong></p>
+                <table style="width:100%; border-collapse:collapse; margin:8px 0; font-size:12px;">
+                    <tr style="background:#f0fdf4;">
+                        <th style="border:1px solid #ddd; padding:8px; text-align:left;">用户说的话</th>
+                        <th style="border:1px solid #ddd; padding:8px; text-align:left;">系统做什么</th>
+                        <th style="border:1px solid #ddd; padding:8px; text-align:left;">语音回复</th>
+                    </tr>
+                    <tr>
+                        <td style="border:1px solid #ddd; padding:8px;">「三元里今天运了多少车」</td>
+                        <td style="border:1px solid #ddd; padding:8px;">查地磅系统 → 统计今日过磅记录</td>
+                        <td style="border:1px solid #ddd; padding:8px;">「三元里今天共运输 127 车次，总重量 1850 吨」</td>
+                    </tr>
+                    <tr style="background:#fafafa;">
+                        <td style="border:1px solid #ddd; padding:8px;">「张三今天上班了吗」</td>
+                        <td style="border:1px solid #ddd; padding:8px;">查考勤系统 → 获取张三今日打卡情况</td>
+                        <td style="border:1px solid #ddd; padding:8px;">「张三今天已打卡，上午 8:03 到岗」</td>
+                    </tr>
+                    <tr>
+                        <td style="border:1px solid #ddd; padding:8px;">「查下粤A12345的进出记录」</td>
+                        <td style="border:1px solid #ddd; padding:8px;">查车牌系统 → 获取该车辆通行历史</td>
+                        <td style="border:1px solid #ddd; padding:8px;">「最近一周粤A12345共进出 15 次，最近一次是今天上午 9:20」</td>
+                    </tr>
+                </table>
+
+                <p><strong>🔹 设备控制场景示例：</strong></p>
+                <table style="width:100%; border-collapse:collapse; margin:8px 0; font-size:12px;">
+                    <tr style="background:#fef3c7;">
+                        <th style="border:1px solid #ddd; padding:8px; text-align:left;">用户说的话</th>
+                        <th style="border:1px solid #ddd; padding:8px; text-align:left;">系统做什么</th>
+                        <th style="border:1px solid #ddd; padding:8px; text-align:left;">语音回复</th>
+                    </tr>
+                    <tr>
+                        <td style="border:1px solid #ddd; padding:8px;">「把客厅灯打开」</td>
+                        <td style="border:1px solid #ddd; padding:8px;">向智能家居发送开灯指令</td>
+                        <td style="border:1px solid #ddd; padding:8px;">「好的，客厅灯已打开」</td>
+                    </tr>
+                    <tr style="background:#fafafa;">
+                        <td style="border:1px solid #ddd; padding:8px;">「空调调到 26 度」</td>
+                        <td style="border:1px solid #ddd; padding:8px;">向智能家居发送温度调节指令</td>
+                        <td style="border:1px solid #ddd; padding:8px;">「已将空调设置为 26 度」</td>
+                    </tr>
+                    <tr>
+                        <td style="border:1px solid #ddd; padding:8px;">「放首歌听听」</td>
+                        <td style="border:1px solid #ddd; padding:8px;">向音响发送播放音乐指令</td>
+                        <td style="border:1px solid #ddd; padding:8px;">「好的，正在为您播放音乐」</td>
+                    </tr>
+                </table>
+
+                <p><strong>🔹 业务能力可扩展</strong></p>
+                <p>系统采用插件化设计，数据查询和设备控制的能力可以灵活增减。例如新增「气象数据查询」「门禁控制」「视频监控调取」等能力，只需接入对应的数据源或设备系统即可，无需修改核心框架。</p>
+            </div>
+        </details>
+    </div>
+</div>
+
+<script>
+    mermaid.initialize({
+        startOnLoad: true,
+        theme: 'base',
+        themeVariables: {
+            fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif',
+            fontSize: '13px',
+            primaryColor: '#eef2ff',
+            primaryTextColor: '#1e1b4b',
+            primaryBorderColor: '#818cf8',
+            lineColor: '#94a3b8',
+            secondaryColor: '#f0fdf4',
+            tertiaryColor: '#fefce8',
+        },
+        flowchart: {
+            useMaxWidth: true,
+            htmlLabels: true,
+            curve: 'basis',
+            nodeSpacing: 40,
+            rankSpacing: 50,
+        }
+    });
+</script>
+</body>
+</html>

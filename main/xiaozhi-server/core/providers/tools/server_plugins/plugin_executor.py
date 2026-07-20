@@ -1,5 +1,7 @@
 """服务端插件工具执行器"""
 
+import asyncio
+import concurrent.futures
 from typing import Dict, Any, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -27,14 +29,22 @@ class ServerPluginExecutor(ToolExecutor):
 
         try:
             # 根据工具类型决定如何调用
+            # 关键修复：SYSTEM_CTL 类型的函数（如 staff_safe_query）是同步阻塞函数，
+            # 需要在线程池中执行，否则会阻塞事件循环导致 TTS 会话启动超时
             if hasattr(func_item, "type"):
                 func_type = func_item.type
                 if func_type.code in [4, 5]:  # SYSTEM_CTL, IOT_CTL (需要conn参数)
-                    result = func_item.func(conn, **arguments)
+                    result = await asyncio.get_event_loop().run_in_executor(
+                        conn.executor,
+                        lambda: func_item.func(conn, **arguments)
+                    )
                 elif func_type.code == 2:  # WAIT
                     result = func_item.func(**arguments)
                 elif func_type.code == 3:  # CHANGE_SYS_PROMPT
-                    result = func_item.func(conn, **arguments)
+                    result = await asyncio.get_event_loop().run_in_executor(
+                        conn.executor,
+                        lambda: func_item.func(conn, **arguments)
+                    )
                 else:
                     result = func_item.func(**arguments)
             else:
@@ -70,6 +80,16 @@ class ServerPluginExecutor(ToolExecutor):
 
         # 合并所有需要的函数
         all_required_functions = list(set(necessary_functions + config_functions))
+
+        # 安全网：自动包含所有 SYSTEM_CTL 类型的注册函数，防止因 API 配置覆盖导致系统工具丢失
+        # SYSTEM_CTL (code=4) 类型的函数如 analyze_weighbridge_data、analyze_personnel_data 等是系统核心功能
+        system_ctl_functions = []
+        for func_name, func_item in all_function_registry.items():
+            if hasattr(func_item, "type") and func_item.type is not None:
+                if func_item.type.code == 4:  # ToolType.SYSTEM_CTL
+                    system_ctl_functions.append(func_name)
+
+        all_required_functions = list(set(all_required_functions + system_ctl_functions))
 
         for func_name in all_required_functions:
             func_item = all_function_registry.get(func_name)

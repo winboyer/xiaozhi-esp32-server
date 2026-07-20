@@ -1,3 +1,4 @@
+import time
 import httpx
 import openai
 from openai.types import CompletionUsage
@@ -8,6 +9,10 @@ from urllib.parse import urlparse
 
 TAG = __name__
 logger = setup_logging()
+
+# 速率限制重试配置
+MAX_RETRIES = 3
+INITIAL_BACKOFF = 2.0  # 初始退避时间（秒）
 
 # 需要禁用思考模式的平台域名及其对应参数（默认关闭思考模式）
 THINKING_DISABLED_DOMAINS = {
@@ -88,31 +93,50 @@ class LLMProvider(LLMProviderBase):
                 logger.bind(tag=TAG).info(f"为域名 {domain} 禁用思考模式，参数: {params}")
                 break
 
-    def response(self, session_id, dialogue, **kwargs):
-        dialogue = self.normalize_dialogue(dialogue)
-
+    def _create_request_params(self, dialogue, **kwargs):
+        """构建请求参数"""
         request_params = {
             "model": self.model_name,
             "messages": dialogue,
             "stream": True,
         }
-
-        # 添加可选参数,只有当参数不为None时才添加
         optional_params = {
             "max_tokens": kwargs.get("max_tokens", self.max_tokens),
             "temperature": kwargs.get("temperature", self.temperature),
             "top_p": kwargs.get("top_p", self.top_p),
             "frequency_penalty": kwargs.get("frequency_penalty", self.frequency_penalty),
         }
-
         for key, value in optional_params.items():
             if value is not None:
                 request_params[key] = value
-
-        # 禁用思考模式
         self._apply_thinking_disabled(request_params)
+        return request_params
 
-        responses = self.client.chat.completions.create(**request_params)
+    def _call_with_retry(self, request_params):
+        """带速率限制重试的 API 调用"""
+        last_exception = None
+        for attempt in range(MAX_RETRIES + 1):
+            try:
+                return self.client.chat.completions.create(**request_params)
+            except openai.RateLimitError as e:
+                last_exception = e
+                if attempt < MAX_RETRIES:
+                    wait_time = INITIAL_BACKOFF * (2 ** attempt)
+                    logger.bind(tag=TAG).warning(
+                        f"速率限制 (429)，第 {attempt + 1}/{MAX_RETRIES} 次重试，等待 {wait_time:.1f} 秒..."
+                    )
+                    time.sleep(wait_time)
+                else:
+                    raise
+            except Exception:
+                raise
+        raise last_exception
+
+    def response(self, session_id, dialogue, **kwargs):
+        dialogue = self.normalize_dialogue(dialogue)
+        request_params = self._create_request_params(dialogue, **kwargs)
+
+        responses = self._call_with_retry(request_params)
 
         is_active = True
         try:            
@@ -158,7 +182,7 @@ class LLMProvider(LLMProviderBase):
         # 禁用思考模式
         self._apply_thinking_disabled(request_params)
 
-        stream = self.client.chat.completions.create(**request_params)
+        stream = self._call_with_retry(request_params)
 
         try:
             for chunk in stream:

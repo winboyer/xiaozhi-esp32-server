@@ -136,6 +136,19 @@ class UnifiedToolHandler:
         """检查是否有指定工具"""
         return self.tool_manager.has_tool(tool_name)
 
+    def _normalize_tool_name(self, name: str) -> str:
+        """修正 LLM 可能遗漏下划线的工具名（如 analyzeweighbridgedata -> analyze_weighbridge_data）"""
+        if not name or "_" in name or "-" in name:
+            return name  # 已有下划线或连字符，无需修正
+        normalized_input = name.lower()
+        for registered_name in self.tool_manager.get_all_tools().keys():
+            if registered_name.replace("_", "").replace("-", "").lower() == normalized_input:
+                self.logger.info(
+                    f"工具名自动修正: '{name}' -> '{registered_name}'"
+                )
+                return registered_name
+        return name
+
     async def handle_llm_function_call(
         self, conn, function_call_data: Dict[str, Any]
     ) -> Optional[ActionResponse]:
@@ -153,6 +166,8 @@ class UnifiedToolHandler:
 
             # 处理单函数调用
             function_name = function_call_data["name"]
+            # 修正 LLM 可能遗漏下划线的工具名
+            function_name = self._normalize_tool_name(function_name)
             arguments = function_call_data.get("arguments", {})
 
             # 如果arguments是字符串，尝试解析为JSON
@@ -170,7 +185,13 @@ class UnifiedToolHandler:
 
             # 发送工具调用显示消息到设备
             try:
-                await send_display_message(self.conn, f"% {function_name}")
+                # 对于 staff_safe_query，显示用户的实际查询内容而非函数名
+                if function_name == "staff_safe_query" and isinstance(arguments, dict):
+                    user_query = arguments.get("query", function_name)
+                    display_text = f"% {user_query}"
+                else:
+                    display_text = f"% {function_name}"
+                await send_display_message(self.conn, display_text)
             except Exception as e:
                 self.logger.warning(f"发送工具调用显示消息失败: {e}")
 
