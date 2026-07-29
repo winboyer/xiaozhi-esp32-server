@@ -308,6 +308,16 @@ async def send_tts_message(conn: "ConnectionHandler", state, text=None):
             conn.audio_rate_controller.stop_sending()
         conn.clearSpeakStatus()
 
+        # 推送 round_end 事件到数字孪生平
+        user_text = getattr(conn, "_dt_last_user_text", "")
+        assistant_text = getattr(conn, "_dt_cumulative_text", "")
+        conn._dt_push_round_end(
+            reason="completed",
+            user_text=user_text,
+            assistant_text=assistant_text,
+            action_type="llm_summary",
+        )
+
     # 发送消息到客户端
     await conn.websocket.send(json.dumps(message))
 

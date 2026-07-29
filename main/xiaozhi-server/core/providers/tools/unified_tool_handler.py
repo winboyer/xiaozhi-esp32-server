@@ -137,12 +137,12 @@ class UnifiedToolHandler:
         return self.tool_manager.has_tool(tool_name)
 
     def _normalize_tool_name(self, name: str) -> str:
-        """修正 LLM 可能遗漏下划线的工具名（如 analyzeweighbridgedata -> analyze_weighbridge_data）"""
-        if not name or "_" in name or "-" in name:
-            return name  # 已有下划线或连字符，无需修正
+        """修正 LLM 可能遗漏下划线、点号的工具名（如 selfaudiospeakersetvolume -> self.audio_speaker.set_volume）"""
+        if not name or "_" in name or "-" in name or "." in name:
+            return name  # 已有分隔符，无需修正
         normalized_input = name.lower()
         for registered_name in self.tool_manager.get_all_tools().keys():
-            if registered_name.replace("_", "").replace("-", "").lower() == normalized_input:
+            if registered_name.replace("_", "").replace("-", "").replace(".", "").lower() == normalized_input:
                 self.logger.info(
                     f"工具名自动修正: '{name}' -> '{registered_name}'"
                 )

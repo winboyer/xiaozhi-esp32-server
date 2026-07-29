@@ -16,6 +16,17 @@ TAG = __name__
 logger = setup_logging()
 
 
+def _invalidate_intent_cache(conn: "ConnectionHandler"):
+    """清除意图识别缓存，确保新注册的 MCP 工具对意图 LLM 可见"""
+    try:
+        from core.utils.cache.manager import cache_manager, CacheType
+
+        cache_manager.clear(CacheType.INTENT, namespace=conn.device_id or "")
+        logger.bind(tag=TAG).info("已清除意图识别缓存")
+    except Exception as e:
+        logger.bind(tag=TAG).warning(f"清除意图缓存失败（不影响功能）: {e}")
+
+
 class MCPClient:
     """设备端MCP客户端，用于管理MCP状态和工具"""
 
@@ -216,6 +227,9 @@ async def handle_mcp_message(
                     if hasattr(conn, "func_handler") and conn.func_handler:
                         conn.func_handler.tool_manager.refresh_tools()
                         conn.func_handler.current_support_functions()
+
+                    # 清除意图识别缓存，使新注册的 MCP 工具对 LLM 可见
+                    _invalidate_intent_cache(conn)
             return
 
     # Handle method calls (requests from the client)

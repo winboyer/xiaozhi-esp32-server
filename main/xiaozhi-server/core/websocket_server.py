@@ -35,6 +35,8 @@ from config.config_loader import get_config_from_api_async
 from core.auth import AuthManager, AuthenticationError
 from core.utils.modules_initialize import initialize_modules
 from core.utils.util import check_vad_update, check_asr_update
+from core.digital_twin.digital_twin_manager import DigitalTwinManager
+from core.digital_twin.digital_twin_handler import DigitalTwinHandler
 
 TAG = __name__
 
@@ -68,6 +70,9 @@ class WebSocketServer:
         expire_seconds = auth_config.get("expire_seconds", None)
         self.auth = AuthManager(secret_key=secret_key, expire_seconds=expire_seconds)
 
+        # 数字孪生推送管理器
+        self.dt_manager = DigitalTwinManager(self.logger)
+
     async def start(self):
         server_config = self.config["server"]
         host = server_config.get("ip", "0.0.0.0")
@@ -79,13 +84,19 @@ class WebSocketServer:
             await asyncio.Future()
 
     async def _handle_connection(self, websocket: websockets.ServerConnection):
+        # ---- 路由分发：数字孪生 vs OTA 设备 ----
+        request_path = websocket.request.path if websocket.request.path else ""
+        if request_path.startswith("/xiaozhi/digital-twin/"):
+            await self._handle_digital_twin_connection(websocket)
+            return
+
+        # ---- 以下是 OTA 设备连接流程 ----
         headers = dict(websocket.request.headers)
         if headers.get("device-id", None) is None:
             # 尝试从 URL 的查询参数中获取 device-id
             from urllib.parse import parse_qs, urlparse
 
             # 从 WebSocket 请求中获取路径
-            request_path = websocket.request.path
             if not request_path:
                 self.logger.bind(tag=TAG).error("无法获取请求路径")
                 await websocket.close()
@@ -142,6 +153,25 @@ class WebSocketServer:
                 self.logger.bind(tag=TAG).error(
                     f"服务器端强制关闭连接时出错: {close_error}"
                 )
+
+    async def _handle_digital_twin_connection(self, websocket: websockets.ServerConnection):
+        """处理数字孪生平 WebSocket 连接"""
+        self.logger.bind(tag=TAG).info("数字孪生平台客户端已连接")
+        handler = DigitalTwinHandler(websocket, self.dt_manager, self.logger)
+        try:
+            await handler.handle()
+        except Exception as e:
+            self.logger.bind(tag=TAG).error(f"数字孪生连接处理出错: {e}")
+        finally:
+            try:
+                if hasattr(websocket, "closed") and not websocket.closed:
+                    await websocket.close()
+                elif hasattr(websocket, "state") and websocket.state.name != "CLOSED":
+                    await websocket.close()
+                else:
+                    await websocket.close()
+            except Exception:
+                pass
 
     async def _http_response(self, websocket, request_headers):
         # 检查是否为 WebSocket 升级请求

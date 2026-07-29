@@ -1,0 +1,189 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 800" width="100%" height="100%" style="background-color:#FFF;font-family:Helvetica,Arial,'Microsoft YaHei',sans-serif">
+  <style>
+    .h{font-size:13px;font-weight:bold;fill:#000;text-anchor:middle}
+    .hs{font-size:9px;fill:#000;text-anchor:middle}
+    .t{font-size:10px;fill:#000;font-weight:500}
+    .tb{font-weight:bold;fill:#000}
+    .ts{font-size:9px;fill:#000;font-weight:bold}
+    .tt{font-size:20px;font-weight:bold;fill:#000;text-anchor:middle}
+    .ar{stroke:#000;stroke-width:1.8;fill:none}
+    .ad{stroke:#000;stroke-width:1.3;stroke-dasharray:6,4;fill:none}
+    .bx{fill:none;stroke:#000;stroke-width:1.5;rx:6}
+    .ll{stroke:#000;stroke-width:1.2;stroke-dasharray:6,5}
+  </style>
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 1L10 5L0 9z" fill="#000"/>
+    </marker>
+    <marker id="ad" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 1L10 5L0 9z" fill="#000"/>
+    </marker>
+  </defs>
+
+  <!-- Title -->
+  <rect x="0" y="0" width="1200" height="50" fill="none" stroke="#000" stroke-width="1.5"/>
+  <text x="600" y="24" class="tt">语音交互数据流简图</text>
+  <text x="600" y="42" class="t" text-anchor="middle" font-size="11">Voice Interaction Data Flow — Construction Archive Scenario</text>
+
+  <!-- ===== 7 Swimlane Headers ===== -->
+  <!-- x positions: 15, 130, 245, 380, 535, 710, 885, width ≈ 100 each -->
+  <g transform="translate(15,65)">
+    <rect width="100" height="36" rx="4" fill="none" stroke="#000" stroke-width="1.3"/>
+    <text x="50" y="16" class="h">OTA 设备</text>
+    <text x="50" y="29" class="hs">麦克风 / 扬声器</text>
+  </g>
+  <g transform="translate(130,65)">
+    <rect width="100" height="36" rx="4" fill="none" stroke="#000" stroke-width="1.3"/>
+    <text x="50" y="16" class="h">WebSocket</text>
+    <text x="50" y="29" class="hs">网关层</text>
+  </g>
+  <g transform="translate(245,65)">
+    <rect width="110" height="36" rx="4" fill="none" stroke="#000" stroke-width="1.3"/>
+    <text x="55" y="16" class="h">语音管线</text>
+    <text x="55" y="29" class="hs">VAD → ASR → 文本</text>
+  </g>
+  <g transform="translate(370,65)">
+    <rect width="120" height="36" rx="4" fill="none" stroke="#000" stroke-width="1.3"/>
+    <text x="60" y="16" class="h">意图理解</text>
+    <text x="60" y="29" class="hs">Intent Handler</text>
+  </g>
+  <g transform="translate(505,65)">
+    <rect width="130" height="36" rx="4" fill="none" stroke="#000" stroke-width="1.3"/>
+    <text x="65" y="16" class="h">AI 网关 + LLM</text>
+    <text x="65" y="29" class="hs">推理 / Function Call</text>
+  </g>
+  <g transform="translate(650,65)">
+    <rect width="110" height="36" rx="4" fill="none" stroke="#000" stroke-width="1.3"/>
+    <text x="55" y="16" class="h">MCP 工具层</text>
+    <text x="55" y="29" class="hs">工具执行调度</text>
+  </g>
+  <g transform="translate(775,65)">
+    <rect width="110" height="36" rx="4" fill="none" stroke="#000" stroke-width="1.3"/>
+    <text x="55" y="16" class="h">数据源层</text>
+    <text x="55" y="29" class="hs">MySQL / API</text>
+  </g>
+
+  <!-- ===== Lifelines ===== -->
+  <line x1="65"  y1="105" x2="65"  y2="740" class="ll"/>
+  <line x1="180" y1="105" x2="180" y2="740" class="ll"/>
+  <line x1="300" y1="105" x2="300" y2="740" class="ll"/>
+  <line x1="430" y1="105" x2="430" y2="740" class="ll"/>
+  <line x1="570" y1="105" x2="570" y2="740" class="ll"/>
+  <line x1="705" y1="105" x2="705" y2="740" class="ll"/>
+  <line x1="830" y1="105" x2="830" y2="740" class="ll"/>
+
+  <!-- ===== Helper macros via direct elements ===== -->
+
+  <!-- ========== STEP 1: Voice Input (y=125) ========== -->
+  <g transform="translate(0,125)">
+    <!-- OTA → WebSocket: PCM 音频 -->
+    <line x1="65" y1="14" x2="180" y2="14" class="ar" marker-end="url(#a)"/>
+    <text x="122" y="5" class="tb" text-anchor="middle" font-size="11">① PCM 音频帧 (16kHz/16bit)</text>
+    <text x="122" y="18" class="t" text-anchor="middle" font-size="9">WebSocket 二进制帧</text>
+
+    <!-- WebSocket → 语音管线 -->
+    <line x1="180" y1="36" x2="300" y2="36" class="ar" marker-end="url(#a)"/>
+    <text x="240" y="27" class="tb" text-anchor="middle" font-size="11">② 音频转发</text>
+  </g>
+
+  <!-- ========== STEP 2: Audio Processing (y=195) ========== -->
+  <g transform="translate(0,195)">
+    <!-- VAD self-loop -->
+    <path d="M300 8 L324 8 L324 22 L300 22" class="ar" marker-end="url(#a)"/>
+    <text x="330" y="17" class="ts">VAD 检测 (逐帧判定)</text>
+
+    <!-- ASR self-loop -->
+    <path d="M300 34 L324 34 L324 48 L300 48" class="ar" marker-end="url(#a)"/>
+    <text x="330" y="43" class="ts">ASR 流式识别</text>
+
+    <!-- 语音管线 → 意图理解 -->
+    <line x1="300" y1="68" x2="430" y2="68" class="ar" marker-end="url(#a)"/>
+    <text x="365" y="59" class="tb" text-anchor="middle" font-size="11">③ ASR 文本 → startToChat()</text>
+  </g>
+
+  <!-- ========== STEP 3: Intent Understanding (y=295) ========== -->
+  <g transform="translate(0,295)">
+    <!-- Fast path self-loop -->
+    <path d="M430 8 L454 8 L454 24 L430 24" class="ad" marker-end="url(#ad)"/>
+    <text x="460" y="18" class="ts">设备指令快速路径 (正则 ~0ms)</text>
+
+    <!-- Fast path return -->
+    <line x1="430" y1="38" x2="65" y2="38" stroke="#000" stroke-width="1.3" stroke-dasharray="5,4" marker-end="url(#ad)"/>
+    <text x="247" y="29" class="t" text-anchor="middle" font-size="9">命中: 直接构造 function_call → 跳过 LLM</text>
+
+    <!-- Intent → AI Gateway -->
+    <line x1="430" y1="58" x2="570" y2="58" class="ar" marker-end="url(#a)"/>
+    <text x="500" y="49" class="tb" text-anchor="middle" font-size="11">④ 意图分析 → LLM 推理</text>
+    <text x="500" y="62" class="t" text-anchor="middle" font-size="9">analyze_intent_with_llm()</text>
+  </g>
+
+  <!-- ========== STEP 4: AI Gateway + LLM (y=400) ========== -->
+  <g transform="translate(0,400)">
+    <!-- LLM self-loop -->
+    <path d="M570 8 L594 8 L594 26 L570 26" class="ar" marker-end="url(#a)"/>
+    <text x="600" y="19" class="ts">LLM 推理: 意图识别 + 工具选择 + 参数构造</text>
+
+    <!-- LLM return with function_call -->
+    <line x1="570" y1="40" x2="430" y2="40" stroke="#000" stroke-width="1.3" stroke-dasharray="5,4" marker-end="url(#ad)"/>
+    <text x="500" y="31" class="t" text-anchor="middle" font-size="9">返回 function_call: {name, arguments}</text>
+
+    <!-- Intent dispatches to MCP -->
+    <line x1="430" y1="58" x2="705" y2="58" class="ar" marker-end="url(#a)"/>
+    <text x="567" y="49" class="tb" text-anchor="middle" font-size="11">⑤ 分发 Function Call → MCP 工具层</text>
+    <text x="567" y="62" class="t" text-anchor="middle" font-size="9">handle_llm_function_call()</text>
+  </g>
+
+  <!-- ========== STEP 5: MCP Tool Execution (y=505) ========== -->
+  <g transform="translate(0,505)">
+    <!-- MCP self-loop -->
+    <path d="M705 8 L729 8 L729 24 L705 24" class="ar" marker-end="url(#a)"/>
+    <text x="735" y="18" class="ts">工具执行调度</text>
+
+    <!-- MCP → Data Source -->
+    <line x1="705" y1="40" x2="830" y2="40" class="ar" marker-end="url(#a)"/>
+    <text x="767" y="31" class="tb" text-anchor="middle" font-size="11">⑥ 数据请求</text>
+    <text x="767" y="44" class="t" text-anchor="middle" font-size="9">MySQL / HTTP API</text>
+
+    <!-- Data Source self-loop -->
+    <path d="M830 58 L854 58 L854 74 L830 74" class="ar" marker-end="url(#a)"/>
+    <text x="860" y="68" class="ts">施工监测数据: 潮白河DB / 塔机 / 地磅 / 电梯</text>
+
+    <!-- Data Source return to MCP -->
+    <line x1="830" y1="90" x2="705" y2="90" stroke="#000" stroke-width="1.3" stroke-dasharray="5,4" marker-end="url(#ad)"/>
+    <text x="767" y="81" class="t" text-anchor="middle" font-size="9">返回原始数据</text>
+  </g>
+
+  <!-- ========== STEP 6: Result Flow Back (y=635) ========== -->
+  <g transform="translate(0,635)">
+    <!-- LLM generation -->
+    <line x1="705" y1="8" x2="570" y2="8" stroke="#000" stroke-width="1.3" stroke-dasharray="5,4" marker-end="url(#ad)"/>
+    <text x="637" y="6" class="t" text-anchor="middle" font-size="9">工具结果返回 LLM</text>
+
+    <path d="M570 20 L594 20 L594 36 L570 36" class="ar" marker-end="url(#a)"/>
+    <text x="600" y="30" class="ts">LLM 生成自然语言回复</text>
+
+    <!-- Reply back to Intent Handler -->
+    <line x1="570" y1="50" x2="430" y2="50" stroke="#000" stroke-width="1.3" stroke-dasharray="5,4" marker-end="url(#ad)"/>
+    <text x="500" y="41" class="t" text-anchor="middle" font-size="9">返回回复文本</text>
+
+    <!-- TTS synthesis -->
+    <path d="M430 64 L454 64 L454 80 L430 80" class="ar" marker-end="url(#a)"/>
+    <text x="460" y="74" class="ts">TTS 合成 (tts_one_sentence)</text>
+
+    <!-- Audio to WebSocket -->
+    <line x1="430" y1="94" x2="180" y2="94" class="ar" marker-end="url(#a)"/>
+    <text x="305" y="85" class="tb" text-anchor="middle" font-size="11">⑦ Opus 编码音频 [60ms] → WebSocket 流式推送</text>
+
+    <!-- Audio playback -->
+    <line x1="180" y1="108" x2="65" y2="108" class="ar" marker-end="url(#a)"/>
+    <text x="122" y="106" class="tb" text-anchor="middle" font-size="11">⑧ 扬声器播放</text>
+  </g>
+
+  <!-- ===== LEGEND ===== -->
+  <g transform="translate(15,745)">
+    <line x1="0" y1="6" x2="36" y2="6" stroke="#000" stroke-width="1.8" marker-end="url(#a)"/>
+    <text x="42" y="10" class="t">同步请求</text>
+    <line x1="110" y1="6" x2="146" y2="6" stroke="#000" stroke-width="1.3" stroke-dasharray="5,4" marker-end="url(#ad)"/>
+    <text x="152" y="10" class="t">异步返回</text>
+  </g>
+</svg>

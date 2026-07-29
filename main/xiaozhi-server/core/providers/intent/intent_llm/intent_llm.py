@@ -241,7 +241,9 @@ class IntentProvider(IntentProviderBase):
             )
             return cached_intent
 
-        if self.promot == "":
+        if self.promot == "" or getattr(self, "_prompt_mcp_tool_count", 0) != (
+            len(conn.mcp_client.tools) if hasattr(conn, "mcp_client") and conn.mcp_client else 0
+        ):
             functions = conn.func_handler.get_functions()
             if hasattr(conn, "mcp_client"):
                 mcp_tools = conn.mcp_client.get_available_tools()
@@ -249,6 +251,10 @@ class IntentProvider(IntentProviderBase):
                     if functions is None:
                         functions = []
                     functions.extend(mcp_tools)
+                # 记录当前 MCP 工具数量，用于检测工具列表变化
+                self._prompt_mcp_tool_count = len(conn.mcp_client.tools)
+            else:
+                self._prompt_mcp_tool_count = 0
 
             self.promot = self.get_intent_system_prompt(functions)
 

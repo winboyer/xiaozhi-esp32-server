@@ -171,9 +171,33 @@ async def get_weather(conn: "ConnectionHandler", location: str = None, lang: str
     from core.utils.cache.manager import cache_manager, CacheType
 
     weather_config = conn.config.get("plugins", {}).get("get_weather", {})
-    api_host = weather_config.get("api_host", "mj7p3y7naa.re.qweatherapi.com")
-    api_key = weather_config.get("api_key", "a861d0d5e7bf4ee1a83d9a9e4f96d4da")
-    default_location = weather_config.get("default_location", "广州")
+    # 处理从管理端API获取的 JSON 字符串配置
+    if isinstance(weather_config, str):
+        try:
+            import json
+            weather_config = json.loads(weather_config)
+        except Exception:
+            weather_config = {}
+    if not isinstance(weather_config, dict):
+        weather_config = {}
+    # 已知有效的默认值（与 config.yaml 保持一致）
+    _DEFAULT_HOST = "mx3v59pgjm.re.qweatherapi.com"
+    _DEFAULT_KEY = "49d53330fd4f48e78e99eea3aa13f329"
+
+    api_host = weather_config.get("api_host", _DEFAULT_HOST)
+    api_key = weather_config.get("api_key", _DEFAULT_KEY)
+
+    # 如果远程配置的值是已知的旧/无效凭证，回退到默认值
+    _OLD_INVALID_HOSTS = {"mj7p3y7naa.re.qweatherapi.com"}
+    _OLD_INVALID_KEYS = {"a861d0d5e7bf4ee1a83d9a9e4f96d4da"}
+    if api_host in _OLD_INVALID_HOSTS:
+        logger.bind(tag=TAG).warning(f"检测到旧 host: {api_host}，回退到默认值")
+        api_host = _DEFAULT_HOST
+    if api_key in _OLD_INVALID_KEYS:
+        logger.bind(tag=TAG).warning("检测到旧 api_key，回退到默认值")
+        api_key = _DEFAULT_KEY
+
+    default_location = weather_config.get("default_location", "武汉")
     client_ip = conn.client_ip
 
     # 优先使用用户提供的location参数
@@ -203,6 +227,10 @@ async def get_weather(conn: "ConnectionHandler", location: str = None, lang: str
         return ActionResponse(Action.REQLLM, cached_weather_report, None)
 
     # 缓存未命中，获取实时天气数据
+    key_masked = api_key[:4] + "***" if api_key and len(api_key) > 4 else "***"
+    logger.bind(tag=TAG).info(
+        f"查询天气: location={location}, host={api_host}, key={key_masked}"
+    )
     city_info = await fetch_city_info(location, api_key, api_host)
     if not city_info:
         return ActionResponse(

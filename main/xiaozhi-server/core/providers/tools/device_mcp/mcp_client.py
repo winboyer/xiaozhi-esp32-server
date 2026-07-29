@@ -8,6 +8,47 @@ from config.logger import setup_logging
 TAG = __name__
 logger = setup_logging()
 
+# ---------------------------------------------------------------------------
+# 默认设备 MCP 工具定义（服务启动时预注册，无需等待设备 tools/list 响应）
+# 与 digital-human/js/config/default-mcp-tools.json 保持同步
+# ---------------------------------------------------------------------------
+DEFAULT_DEVICE_MCP_TOOLS = [
+    {
+        "name": "self.audio_speaker.set_volume",
+        "description": (
+            "Set the volume of the audio speaker (0-100). "
+            "Call this tool directly when user wants to adjust volume. "
+            "Example: user says '音量调到80' → call with volume=80."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"volume": {"type": "integer", "minimum": 0, "maximum": 100}},
+            "required": ["volume"],
+        },
+    },
+    {
+        "name": "self.get_device_status",
+        "description": (
+            "查询设备的实时状态信息，包括扬声器音量、屏幕亮度、电池电量、网络连接等。"
+            "仅在用户明确询问设备状态时调用（如：当前音量多少、电量还有多少、屏幕亮度是多少），"
+            "不要作为设备控制的前置步骤。"
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "self.screen.set_brightness",
+        "description": (
+            "设置屏幕亮度（0-100）。"
+            "用户说「屏幕亮度调到X」「亮度高一点」「亮度低一点」时直接调用此工具。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"brightness": {"type": "integer", "minimum": 0, "maximum": 100}},
+            "required": ["brightness"],
+        },
+    },
+]
+
 
 class MCPClient:
     """设备端MCP客户端，用于管理MCP状态和工具"""
@@ -20,6 +61,19 @@ class MCPClient:
         self.next_id = 1
         self.lock = asyncio.Lock()
         self._cached_available_tools = None  # Cache for get_available_tools
+
+    def register_default_tools(self):
+        """预注册默认设备 MCP 工具，确保 LLM 始终可见，不依赖设备 tools/list 响应时序"""
+        for tool_data in DEFAULT_DEVICE_MCP_TOOLS:
+            sanitized_name = sanitize_tool_name(tool_data["name"])
+            if sanitized_name not in self.tools:
+                self.tools[sanitized_name] = dict(tool_data)
+                self.name_mapping[sanitized_name] = tool_data["name"]
+        self._cached_available_tools = None
+        logger.bind(tag=TAG).info(
+            f"预注册 {len(DEFAULT_DEVICE_MCP_TOOLS)} 个默认设备 MCP 工具: "
+            f"{[t['name'] for t in DEFAULT_DEVICE_MCP_TOOLS]}"
+        )
 
     def has_tool(self, name: str) -> bool:
         return name in self.tools

@@ -207,6 +207,14 @@ class ConnectionHandler:
         # 标记当前是否为来电接听模式
         self.incoming_call = None
 
+        # 数字孪生推送相关变量
+        self._dt_text_buffer = ""         # 当前句子文本缓冲区
+        self._dt_chunk_index = 0          # llm_stream chunk 索引
+        self._dt_cumulative_text = ""     # 本轮累积文本
+        self._dt_sentence_id = None       # 当前数字孪生事件 sentence_id
+        self._dt_intent_type = ""         # 当前意图类型
+        self._dt_last_user_text = ""      # 上一轮用户文本（供 round_end 使用）
+
     async def handle_connection(self, ws: websockets.ServerConnection):
         try:
             # 获取运行中的事件循环（必须在异步上下文中）
@@ -964,15 +972,18 @@ class ConnectionHandler:
                     )
                     intent_cfg["llm"] = selected_llm
 
-            # 加载插件配置
+            # 加载插件配置 — 远程覆盖本地，但保留本地未涉及的字段
             if model_intent != "Intent_nointent":
                 plugin_from_server = private_config.get("plugins", {})
                 for plugin, config_str in plugin_from_server.items():
                     plugin_from_server[plugin] = json.loads(config_str)
-                self.config["plugins"] = plugin_from_server
+                # 合并策略：以本地 config.yaml 为底，远程配置覆盖
+                merged_plugins = dict(self.config.get("plugins", {}))
+                merged_plugins.update(plugin_from_server)
+                self.config["plugins"] = merged_plugins
                 self.config["Intent"][self.config["selected_module"]["Intent"]][
                     "functions"
-                ] = plugin_from_server.keys()
+                ] = merged_plugins.keys()
         if private_config.get("prompt", None) is not None:
             self.config["prompt"] = private_config["prompt"]
         # 获取声纹信息
@@ -1145,6 +1156,8 @@ class ConnectionHandler:
                     content_type=ContentType.ACTION,
                 )
             )
+            # 重置数字孪生流式状态
+            self._dt_reset_stream_state(current_sentence_id, self.intent_type)
         else:
             # 递归调用时，使用当前的sentence_id
             current_sentence_id = self.sentence_id
@@ -1269,6 +1282,7 @@ class ConnectionHandler:
                                                 content_detail=new_part,
                                             )
                                         )
+                                        self._dt_accumulate_text(new_part)
                 else:
                     content = response
 
@@ -1292,6 +1306,7 @@ class ConnectionHandler:
                                 content_detail=content,
                             )
                         )
+                        self._dt_accumulate_text(content)
         except Exception as e:
             self.logger.bind(tag=TAG).error(f"LLM stream processing error: {e}")
             self.tts.tts_text_queue.put(
@@ -1459,6 +1474,8 @@ class ConnectionHandler:
                     content_type=ContentType.ACTION,
                 )
             )
+            # 推送 llm_done 到数字孪生平
+            self._dt_push_llm_done()
             # 使用lambda延迟计算，只有在DEBUG级别时才执行get_llm_dialogue()
             self.logger.bind(tag=TAG).debug(
                 lambda: json.dumps(
@@ -1613,6 +1630,202 @@ class ConnectionHandler:
     def clearSpeakStatus(self):
         self.client_is_speaking = False
         self.logger.bind(tag=TAG).debug(f"清除服务端讲话状态")
+
+    # ---------- 数字孪生推送方法 ----------
+
+    def _dt_schedule(self, coro):
+        """调度异步协程，兼容事件循环和线程池两种调用上下文"""
+        try:
+            # 尝试获取当前运行中的事件循环
+            loop = asyncio.get_running_loop()
+            # 在事件循环线程中，直接创建任务
+            asyncio.ensure_future(coro)
+        except RuntimeError:
+            # 在线程池中，使用线程安全方式调度
+            if self.loop:
+                asyncio.run_coroutine_threadsafe(coro, self.loop)
+
+    def _dt_reset_stream_state(self, sentence_id: str, intent_type: str = ""):
+        """重置数字孪生流式状态（新一轮对话开始时调用）"""
+        self._dt_text_buffer = ""
+        self._dt_chunk_index = 0
+        self._dt_cumulative_text = ""
+        self._dt_sentence_id = sentence_id
+        self._dt_intent_type = intent_type or ""
+
+    def _dt_accumulate_text(self, content: str):
+        """累积 LLM 文本并按句推送 llm_stream 到数字孪生平"""
+        if not content or not self.server:
+            return
+        if not hasattr(self.server, "dt_manager") or not self.server.dt_manager:
+            return
+        device_id = self.device_id or ""
+        if not self.server.dt_manager.has_subscribers(device_id):
+            return
+
+        self._dt_text_buffer += content
+        self._dt_cumulative_text += content
+
+        # 句子结束符（中英文）
+        SENTENCE_ENDINGS = set("。！？；\n!?;")
+
+        # 找最后一个句子边界
+        last_idx = -1
+        for i, ch in enumerate(self._dt_text_buffer):
+            if ch in SENTENCE_ENDINGS:
+                last_idx = i
+
+        if last_idx >= 0:
+            sentence = self._dt_text_buffer[: last_idx + 1]
+            self._dt_text_buffer = self._dt_text_buffer[last_idx + 1 :]
+            self._dt_push_stream_sentence(sentence)
+
+    def _dt_push_stream_sentence(self, sentence: str):
+        """推送单个句子的 llm_stream 事件"""
+        device_id = self.device_id or ""
+        project = self.config.get("project")
+        project_str = project.value if hasattr(project, "value") else (project or "")
+
+        event = {
+            "type": "voice_event",
+            "sub_type": "llm_stream",
+            "device_id": device_id,
+            "device_name": "语音助手",
+            "project": str(project_str),
+            "device_session_id": self.session_id,
+            "sentence_id": self._dt_sentence_id,
+            "timestamp": int(time.time() * 1000),
+            "payload": {
+                "chunk_index": self._dt_chunk_index,
+                "delta_text": sentence,
+                "cumulative_text": self._dt_cumulative_text,
+                "is_first": self._dt_chunk_index == 0,
+                "intent_type": self._dt_intent_type,
+            },
+        }
+        self._dt_chunk_index += 1
+
+        self._dt_schedule(
+            self.server.dt_manager.push_event(device_id, event)
+        )
+
+    def _dt_push_llm_done(self):
+        """推送 llm_done 事件 + 冲刷剩余缓冲区"""
+        device_id = self.device_id or ""
+        if not self.server or not hasattr(self.server, "dt_manager"):
+            return
+        if not self.server.dt_manager.has_subscribers(device_id):
+            return
+
+        # 冲刷剩余缓冲区（最后的尾部文本）
+        if self._dt_text_buffer.strip():
+            self._dt_push_stream_sentence(self._dt_text_buffer)
+            self._dt_text_buffer = ""
+
+        project = self.config.get("project")
+        project_str = project.value if hasattr(project, "value") else (project or "")
+
+        event = {
+            "type": "voice_event",
+            "sub_type": "llm_done",
+            "device_id": device_id,
+            "device_name": "语音助手",
+            "project": str(project_str),
+            "device_session_id": self.session_id,
+            "sentence_id": self._dt_sentence_id,
+            "timestamp": int(time.time() * 1000),
+            "payload": {
+                "full_text": self._dt_cumulative_text,
+                "total_chunks": self._dt_chunk_index,
+                "intent_type": self._dt_intent_type,
+                "query_tables": [],
+                "query_fields": [],
+                "timing_ms": {
+                    "total": 0,
+                    "asr": 0,
+                    "intent_classify": 0,
+                    "data_query": 0,
+                    "llm_summary": 0,
+                },
+                "llm_model": self.config.get("llm", {}).get("model_name", ""),
+            },
+        }
+
+        self._dt_schedule(
+            self.server.dt_manager.push_event(device_id, event)
+        )
+
+    def _dt_push_asr(self, text: str, text_raw: str = "", speaker_name: str = None,
+                     asr_backend: str = "", asr_duration_ms: int = 0):
+        """推送 ASR 识别结果到数字孪生平"""
+        device_id = self.device_id or ""
+        if not self.server or not hasattr(self.server, "dt_manager"):
+            return
+        if not self.server.dt_manager.has_subscribers(device_id):
+            return
+
+        project = self.config.get("project")
+        project_str = project.value if hasattr(project, "value") else (project or "")
+
+        event = {
+            "type": "voice_event",
+            "sub_type": "asr",
+            "device_id": device_id,
+            "device_name": "语音助手",
+            "project": str(project_str),
+            "device_session_id": self.session_id,
+            "sentence_id": self._dt_sentence_id or "",
+            "timestamp": int(time.time() * 1000),
+            "payload": {
+                "text": text,
+                "text_raw": text_raw or text,
+                "speaker_name": speaker_name,
+                "asr_backend": asr_backend,
+                "asr_duration_ms": asr_duration_ms,
+            },
+        }
+
+        self._dt_schedule(
+            self.server.dt_manager.push_event(device_id, event)
+        )
+
+    def _dt_push_round_end(self, reason: str, user_text: str = "",
+                           assistant_text: str = "", action_type: str = "llm_summary"):
+        """推送 round_end 事件到数字孪生平"""
+        device_id = self.device_id or ""
+        if not self.server or not hasattr(self.server, "dt_manager"):
+            return
+        if not self.server.dt_manager.has_subscribers(device_id):
+            return
+
+        project = self.config.get("project")
+        project_str = project.value if hasattr(project, "value") else (project or "")
+
+        event = {
+            "type": "voice_event",
+            "sub_type": "round_end",
+            "device_id": device_id,
+            "device_name": "语音助手",
+            "project": str(project_str),
+            "device_session_id": self.session_id,
+            "sentence_id": self._dt_sentence_id or "",
+            "timestamp": int(time.time() * 1000),
+            "payload": {
+                "reason": reason,
+                "summary": {
+                    "user_text": user_text,
+                    "assistant_text": assistant_text,
+                    "intent_type": self._dt_intent_type,
+                    "action_type": action_type,
+                },
+            },
+        }
+
+        self._dt_schedule(
+            self.server.dt_manager.push_event(device_id, event)
+        )
+
+    # ---------- 数字孪生推送方法结束 ----------
 
     async def close(self, ws=None):
         """资源清理方法"""

@@ -30,7 +30,10 @@ logger = setup_logging()
 
 class ASRProviderBase(ABC):
     def __init__(self):
-        pass
+        # 某些 ASR 实现不会显式设置 type/interface_type，默认保持兼容，避免在语音停止处理或分支判断时报错
+        self.type = None
+        self.interface_type = None
+        self._current_artifacts = None
 
     # 打开音频通道
     async def open_audio_channels(self, conn: "ConnectionHandler"):
@@ -158,6 +161,10 @@ class ASRProviderBase(ABC):
             # 性能监控
             total_time = time.monotonic() - total_start_time
             logger.bind(tag=TAG).debug(f"总处理耗时: {total_time:.3f}s")
+
+            # 存储 ASR 耗时和 backend 信息供数字孪生推送使用
+            conn._dt_asr_duration_ms = int(total_time * 1000)
+            conn._dt_asr_backend = self.type or "unknown"
 
             # 检查文本长度
             text_len, _ = remove_punctuation_and_length(content_for_length_check)

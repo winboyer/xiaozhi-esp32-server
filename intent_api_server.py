@@ -51,6 +51,9 @@ SERVER_PORT = int(os.environ.get("INTENT_API_PORT", "8005"))
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://api.deepseek.com")
 LLM_API_KEY = os.environ.get("LLM_API_KEY", "sk-655f2d0a7fa64b089c9155ce8931bb3b")
 LLM_MODEL = os.environ.get("LLM_MODEL", "deepseek-v4-flash")
+LLM_MAX_RETRIES = int(os.environ.get("LLM_MAX_RETRIES", "2"))
+LLM_RETRY_BACKOFF_SECONDS = float(os.environ.get("LLM_RETRY_BACKOFF_SECONDS", "0.8"))
+LLM_RETRY_STATUS_CODES = {408, 429, 500, 502, 503, 504}
 
 # SQL 文件路径
 SQL_FILEPATH = os.environ.get(
@@ -585,6 +588,110 @@ def warmup_llm_connection():
         logger.warning(f"LLM 连接预热失败（不影响服务）: {e}")
 
 
+def _llm_should_retry_status(status_code: int) -> bool:
+    return status_code in LLM_RETRY_STATUS_CODES
+
+
+def _llm_backoff_seconds(attempt: int) -> float:
+    return LLM_RETRY_BACKOFF_SECONDS * max(1, attempt)
+
+
+def _extract_llm_error_body(resp: requests.Response, limit: int = 500) -> str:
+    try:
+        text = resp.text
+    except Exception:
+        text = "<no response body>"
+    return text[:limit]
+
+
+def _post_llm_with_retry(payload: dict, stream: bool = False, timeout: int = 30) -> requests.Response:
+    """发送 LLM 请求并在临时错误（如 502）时自动重试。"""
+    headers = {
+        "Authorization": f"Bearer {LLM_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    session = _get_llm_session()
+    last_exc = None
+
+    for attempt in range(1, LLM_MAX_RETRIES + 2):
+        try:
+            resp = session.post(
+                f"{LLM_BASE_URL}/v1/chat/completions",
+                headers=headers,
+                json=payload,
+                timeout=timeout,
+                stream=stream,
+            )
+
+            if resp.status_code == 200:
+                return resp
+
+            body = _extract_llm_error_body(resp)
+            err = RuntimeError(f"LLM API 错误 ({resp.status_code}): {body}")
+            last_exc = err
+            if attempt <= LLM_MAX_RETRIES and _llm_should_retry_status(resp.status_code):
+                wait_s = _llm_backoff_seconds(attempt)
+                logger.warning(
+                    f"LLM 请求失败 status={resp.status_code}，第 {attempt}/{LLM_MAX_RETRIES + 1} 次重试，"
+                    f"{wait_s:.1f}s 后重试"
+                )
+                time.sleep(wait_s)
+                continue
+            raise err
+        except (requests.Timeout, requests.ConnectionError) as e:
+            last_exc = e
+            if attempt <= LLM_MAX_RETRIES:
+                wait_s = _llm_backoff_seconds(attempt)
+                logger.warning(
+                    f"LLM 请求网络异常: {e}，第 {attempt}/{LLM_MAX_RETRIES + 1} 次重试，"
+                    f"{wait_s:.1f}s 后重试"
+                )
+                time.sleep(wait_s)
+                continue
+            raise RuntimeError(f"LLM API 请求失败: {e}") from e
+
+    if last_exc:
+        raise RuntimeError(f"LLM API 请求失败: {last_exc}")
+    raise RuntimeError("LLM API 请求失败: 未知错误")
+
+
+def _build_stats_fallback_summary(
+    user_query: str,
+    tables: list,
+    matched_fields: list,
+    engine: "DataQueryEngine",
+) -> str:
+    """在 LLM 不可用时，基于预计算统计返回简要可读结果。"""
+    del user_query  # 预留后续按问题细化降级逻辑
+
+    fallback_tables = [t for t in (tables or []) if t in engine.all_stats]
+    if not fallback_tables:
+        fallback_tables = list(engine.all_stats.keys())[:2]
+
+    wanted_fields = [f for f in (matched_fields or []) if isinstance(f, str) and f]
+    lines = ["上游分析服务暂时不可用，以下为数据库统计降级结果："]
+
+    for tname in fallback_tables[:2]:
+        stats = engine.all_stats.get(tname, {})
+        if not stats:
+            continue
+        cn_name = TABLE_CN_NAMES.get(tname, tname)
+        table_fields = [f for f in wanted_fields if f in stats] or list(stats.keys())[:3]
+        if not table_fields:
+            continue
+
+        parts = []
+        for fname in table_fields[:3]:
+            fs = stats[fname]
+            parts.append(f"{fname}最小{fs['min']}，最大{fs['max']}，均值{fs['avg']}")
+        lines.append(f"{cn_name}：" + "；".join(parts))
+
+    if len(lines) == 1:
+        lines.append("当前没有可用统计数据，请稍后重试。")
+
+    return "\n".join(lines)
+
+
 def call_llm_stream(
     system_prompt: str,
     user_message: str,
@@ -595,10 +702,6 @@ def call_llm_stream(
     流式调用 LLM API，逐 chunk yield 文本。
     使用连接池复用 HTTP 连接。
     """
-    headers = {
-        "Authorization": f"Bearer {LLM_API_KEY}",
-        "Content-Type": "application/json",
-    }
     payload = {
         "model": LLM_MODEL,
         "messages": [
@@ -613,16 +716,7 @@ def call_llm_stream(
     logger.info(f"调用 LLM (stream): {LLM_MODEL}")
     start = time.time()
 
-    session = _get_llm_session()
-    with session.post(
-        f"{LLM_BASE_URL}/v1/chat/completions",
-        headers=headers,
-        json=payload,
-        timeout=30,
-        stream=True,
-    ) as resp:
-        if resp.status_code != 200:
-            raise RuntimeError(f"LLM API 错误 ({resp.status_code}): {resp.text[:500]}")
+    with _post_llm_with_retry(payload, stream=True, timeout=30) as resp:
 
         first_token = True
         chunk_count = 0
@@ -664,10 +758,6 @@ def call_llm_sync(
     同步调用 LLM API（非流式），用于意图分类等短响应场景。
     使用连接池复用 HTTP 连接。
     """
-    headers = {
-        "Authorization": f"Bearer {LLM_API_KEY}",
-        "Content-Type": "application/json",
-    }
     payload = {
         "model": LLM_MODEL,
         "messages": [
@@ -682,23 +772,15 @@ def call_llm_sync(
 
     logger.info(f"调用 LLM (sync): {LLM_MODEL}")
     start = time.time()
-
-    session = _get_llm_session()
-    resp = session.post(
-        f"{LLM_BASE_URL}/v1/chat/completions",
-        headers=headers,
-        json=payload,
-        timeout=30,
-    )
+    resp = _post_llm_with_retry(payload, stream=False, timeout=30)
 
     elapsed = time.time() - start
     logger.info(f"LLM sync 完成, 耗时: {elapsed:.2f}s, status={resp.status_code}")
-
-    if resp.status_code != 200:
-        raise RuntimeError(f"LLM API 错误 ({resp.status_code}): {resp.text[:500]}")
-
-    data = resp.json()
-    return data["choices"][0]["message"]["content"]
+    try:
+        data = resp.json()
+        return data["choices"][0]["message"]["content"]
+    except Exception as e:
+        raise RuntimeError(f"LLM API 响应解析失败: {e}") from e
 
 
 # ==================== 关键词匹配（备用，用于非 DB 意图快速路由） ====================
@@ -820,19 +902,23 @@ def classify_intent(user_query: str, engine: DataQueryEngine) -> dict:
     """
     mapping = build_table_mapping(engine)
     user_message = f"可选表:\n{mapping}\n\n问题: {user_query}"
-    raw = call_llm_sync(
-        system_prompt=INTENT_CLASSIFY_PROMPT,
-        user_message=user_message,
-        temperature=0,
-        max_tokens=300,
-        response_format={"type": "json_object"},
-    )
-    raw = raw.strip()
-    # 防御解析：尝试多种方式提取 JSON
-    result = _safe_parse_json(raw)
-    result.setdefault("cat", "db")
-    result.setdefault("tbls", [])
-    return result
+    try:
+        raw = call_llm_sync(
+            system_prompt=INTENT_CLASSIFY_PROMPT,
+            user_message=user_message,
+            temperature=0,
+            max_tokens=300,
+            response_format={"type": "json_object"},
+        )
+        raw = raw.strip()
+        # 防御解析：尝试多种方式提取 JSON
+        result = _safe_parse_json(raw)
+        result.setdefault("cat", "db")
+        result.setdefault("tbls", [])
+        return result
+    except Exception as e:
+        logger.warning(f"意图分类失败，降级为 DB 查询: {e}")
+        return {"cat": "db", "tbls": []}
 
 
 def _safe_parse_json(raw: str) -> dict:
@@ -857,6 +943,34 @@ def _safe_parse_json(raw: str) -> dict:
     # 兜底：返回默认值
     logger.warning(f"无法解析 LLM 分类结果: {raw[:100]}")
     return {"cat": "db", "tbls": []}
+
+
+def _normalize_table_list(raw_tables, engine: "DataQueryEngine") -> list:
+    """规范化 LLM 返回的表名列表，避免异常类型导致调用失败。"""
+    if raw_tables is None:
+        return []
+
+    candidates = []
+    if isinstance(raw_tables, str):
+        text = raw_tables.strip()
+        if text:
+            if text in ("all", "ALL", "全部", "所有"):
+                candidates = list(engine.tables.keys())
+            else:
+                # 兼容 "a,b" / "a，b" / "[a,b]" 这类非标准输出
+                text = text.strip("[]")
+                candidates = [s.strip().strip("\"'") for s in re.split(r"[,，;；\s]+", text) if s.strip()]
+    elif isinstance(raw_tables, (list, tuple, set)):
+        candidates = [x for x in raw_tables if isinstance(x, str) and x.strip()]
+
+    valid_tables = set(engine.tables.keys())
+    normalized = []
+    seen = set()
+    for name in candidates:
+        if name in valid_tables and name not in seen:
+            seen.add(name)
+            normalized.append(name)
+    return normalized
 
 
 # ==================== 第2次 LLM 调用：简要总结 ====================
@@ -900,12 +1014,16 @@ def summarize_stream(user_query: str, tables: list, matched_fields: list, engine
     """
     stats_text = extract_relevant_stats(tables, matched_fields, engine)
     user_message = f"数据:\n{stats_text}\n\n用户问: {user_query}\n简要报告:"
-    yield from call_llm_stream(
-        system_prompt=SUMMARY_BRIEF_PROMPT,
-        user_message=user_message,
-        temperature=0,
-        max_tokens=300,
-    )
+    try:
+        yield from call_llm_stream(
+            system_prompt=SUMMARY_BRIEF_PROMPT,
+            user_message=user_message,
+            temperature=0,
+            max_tokens=300,
+        )
+    except Exception as e:
+        logger.warning(f"LLM 总结失败，使用本地统计降级: {e}")
+        yield _build_stats_fallback_summary(user_query, tables, matched_fields, engine)
 
 
 # ==================== 天气查询（和风天气 API） ====================
@@ -1118,7 +1236,13 @@ class IntentAPIHandler(BaseHTTPRequestHandler):
         if length == 0:
             return {}
         raw = self.rfile.read(length)
-        return json.loads(raw)
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"请求体不是有效 JSON: {e.msg}") from e
+        if not isinstance(data, dict):
+            raise ValueError("请求体必须是 JSON 对象")
+        return data
 
     # ---- 路由 ----
 
@@ -1160,6 +1284,7 @@ class IntentAPIHandler(BaseHTTPRequestHandler):
           第1次：快速意图分类（JSON 输出，仅发表名映射）
           第2次：流式简要总结（仅发相关字段数据）
         """
+        sse_started = False
         try:
             body = self._read_body()
             user_query = body.get("query", "").strip()
@@ -1177,6 +1302,7 @@ class IntentAPIHandler(BaseHTTPRequestHandler):
             self.send_header("Connection", "close")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
+            sse_started = True
 
             # ---- 快速路由：天气关键词直接跳过 LLM 分类 ----
             if any(kw in user_query for kw in ["天气", "气温", "下雨", "刮风", "雾霾", "台风"]):
@@ -1185,8 +1311,11 @@ class IntentAPIHandler(BaseHTTPRequestHandler):
 
             # ---- 第1次 LLM：意图分类 ----
             intent = classify_intent(user_query, self.engine)
-            category = intent.get("cat", "db")
-            tables = intent.get("tbls", [])
+            if not isinstance(intent, dict):
+                intent = {"cat": "db", "tbls": []}
+
+            category = str(intent.get("cat", "db")).strip().lower()
+            tables = _normalize_table_list(intent.get("tbls", []), self.engine)
             logger.info(f"意图分类: cat={category}, tbls={tables}")
 
             if category != "db":
@@ -1194,13 +1323,15 @@ class IntentAPIHandler(BaseHTTPRequestHandler):
                 done = json.dumps({
                     "summary": f"当前仅支持数据库查询。您的意图为「{category}」，暂不支持。",
                     "elapsed_seconds": total_time,
-                    "elapsed_seconds": total_time,
                 }, ensure_ascii=False)
                 self.wfile.write(f"data: {done}\n\n".encode())
                 self.wfile.write("data: [DONE]\n\n".encode())
                 self.wfile.flush()
                 logger.info(f"非DB意图, 耗时: {total_time}s")
                 return
+
+            if not tables:
+                tables = list(self.engine.all_stats.keys())
 
             # ---- 关键词匹配字段（LLM 不再选字段） ----
             matched_fields = []
@@ -1216,13 +1347,18 @@ class IntentAPIHandler(BaseHTTPRequestHandler):
             # ---- 单表：流式简要总结 ----
             self._stream_single_table(user_query, tables[0] if tables else None, matched_fields, start_time)
 
+        except ValueError as e:
+            self._send_json({"error": str(e)}, 400)
         except Exception as e:
             logger.exception("分析失败")
             try:
-                err = json.dumps({"error": str(e)}, ensure_ascii=False)
-                self.wfile.write(f"data: {err}\n\n".encode())
-                self.wfile.write("data: [DONE]\n\n".encode())
-                self.wfile.flush()
+                if sse_started:
+                    err = json.dumps({"error": str(e)}, ensure_ascii=False)
+                    self.wfile.write(f"data: {err}\n\n".encode())
+                    self.wfile.write("data: [DONE]\n\n".encode())
+                    self.wfile.flush()
+                else:
+                    self._send_json({"error": str(e)}, 500)
             except Exception:
                 pass
 
@@ -1246,12 +1382,16 @@ class IntentAPIHandler(BaseHTTPRequestHandler):
         joined_text = self.engine.get_joined_stats(tables)
         user_message = f"数据（按位置合并多表）:\n{joined_text}\n\n用户问: {user_query}\n简要报告:"
         # 用同步调用避免流式偶发的空 token 问题
-        summary = call_llm_sync(
-            system_prompt=SUMMARY_BRIEF_PROMPT,
-            user_message=user_message,
-            temperature=0,
-            max_tokens=300,
-        ).strip()
+        try:
+            summary = call_llm_sync(
+                system_prompt=SUMMARY_BRIEF_PROMPT,
+                user_message=user_message,
+                temperature=0,
+                max_tokens=300,
+            ).strip()
+        except Exception as e:
+            logger.warning(f"JOIN 总结失败，使用本地统计降级: {e}")
+            summary = _build_stats_fallback_summary(user_query, tables, [], self.engine)
         if not summary:
             logger.warning(f"JOIN LLM 返回空, prompt_len={len(user_message)}")
             summary = "数据量较大，请缩小查询范围（如指定具体设备或位置）。"

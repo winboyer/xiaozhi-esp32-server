@@ -19,7 +19,7 @@
     },
     {
         "name": "self.get_device_status",
-        "description": "Provides the real-time information of the device, including the current status of the audio speaker, screen, battery, network, etc.\nUse this tool for: \n1. Answering questions about current condition (e.g. what is the current volume of the audio speaker?)\n2. As the first step to control the device (e.g. turn up / down the volume of the audio speaker, etc.)",
+        "description": "查询设备的实时状态信息，包括扬声器音量、屏幕亮度、电池电量、网络连接等。\n仅在用户明确询问设备状态时调用（如：当前音量多少、电量还有多少、屏幕亮度是多少、网络状态怎么样），不要作为设备控制的前置步骤。",
         "inputSchema": {
             "type": "object",
             "properties": {}
@@ -45,7 +45,7 @@
     },
     {
         "name": "self.audio_speaker.set_volume",
-        "description": "Set the volume of the audio speaker. If the current volume is unknown, you must call `self.get_device_status` tool first and then call this tool.",
+        "description": "设置扬声器音量（0-100）。用户说「音量调到X」「声音大一点」「声音小一点」「静音」时直接调用此工具。",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -67,7 +67,7 @@
     },
     {
         "name": "self.screen.set_brightness",
-        "description": "Set the brightness of the screen.",
+        "description": "设置屏幕亮度（0-100）。用户说「屏幕亮度调到X」「亮度高一点」「亮度低一点」时直接调用此工具。",
         "inputSchema": {
             "type": "object",
             "properties": {

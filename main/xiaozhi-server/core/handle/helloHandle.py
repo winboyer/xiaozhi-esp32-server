@@ -54,7 +54,12 @@ async def handleHelloMessage(conn: "ConnectionHandler", msg_json):
         if features.get("mcp"):
             conn.logger.bind(tag=TAG).debug("客户端支持MCP")
             conn.mcp_client = MCPClient()
-            # 发送初始化
+            # 预注册默认设备 MCP 工具，确保 LLM 在设备 tools/list 响应前即可调用
+            conn.mcp_client.register_default_tools()
+            if hasattr(conn, "func_handler") and conn.func_handler:
+                conn.func_handler.tool_manager.refresh_tools()
+                conn.func_handler.current_support_functions()
+            # 发送初始化（异步，设备响应后可能追加更多工具）
             asyncio.create_task(send_mcp_initialize_message(conn))
         if features.get("aec"):
             conn.logger.bind(tag=TAG).debug("客户端启用了服务端AEC")

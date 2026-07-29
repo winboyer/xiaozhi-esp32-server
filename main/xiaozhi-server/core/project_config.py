@@ -217,8 +217,19 @@ def apply_project_filter(conn: "ConnectionHandler") -> None:
     )
     
     if project == ProjectName.CHAOBAIHE:
-        # 潮白河：数据库查询模式，只保留通用工具
-        _filter_tool_manager(conn, _COMMON_FUNCTIONS, logger, TAG)
+        # 潮白河：数据库查询模式，只保留通用工具，并关闭设备/外部MCP工具
+        _filter_tool_manager(
+            conn,
+            _COMMON_FUNCTIONS,
+            logger,
+            TAG,
+            disallowed_tool_types=frozenset({
+                "device_iot",
+                "device_mcp",
+                "mcp_endpoint",
+                "server_mcp",
+            }),
+        )
         _setup_chaobaihe_mode(conn, logger, TAG)
     else:
         # 三元里 / 将军祠：API 数据接口模式
@@ -231,6 +242,7 @@ def _filter_tool_manager(
     allowed: FrozenSet[str],
     logger,
     TAG: str,
+    disallowed_tool_types: Optional[FrozenSet[str]] = None,
 ) -> None:
     """过滤 ToolManager 中的工具，仅保留白名单内的
     
@@ -247,11 +259,18 @@ def _filter_tool_manager(
     try:
         tm = conn.func_handler.tool_manager
         
-        # 存储允许的工具名集合，供 monkey-patched refresh_tools 使用
+        # 存储允许的工具名集合和禁用的工具类型，供 monkey-patched refresh_tools 使用
         tm._project_allowed_tools = allowed
+        tm._project_disallowed_tool_types = disallowed_tool_types or frozenset()
         
         # ---- 应用当前过滤 ----
-        _apply_tool_cache_filter(tm, allowed, logger, TAG)
+        _apply_tool_cache_filter(
+            tm,
+            allowed,
+            logger,
+            TAG,
+            disallowed_tool_types=disallowed_tool_types,
+        )
         
         # ---- Monkey-patch refresh_tools：确保后续缓存刷新后自动重新过滤 ----
         # 代码中 MCP 初始化、设备连接等场景会调用 refresh_tools() 重置缓存，
@@ -263,7 +282,13 @@ def _filter_tool_manager(
                 _original_refresh()  # 先执行原始刷新（清缓存）
                 # 缓存清空后立即重新填充并过滤
                 tm.get_all_tools()   # 触发重新填充
-                _apply_tool_cache_filter(tm, tm._project_allowed_tools, logger, TAG)
+                _apply_tool_cache_filter(
+                    tm,
+                    tm._project_allowed_tools,
+                    logger,
+                    TAG,
+                    disallowed_tool_types=tm._project_disallowed_tool_types,
+                )
             
             tm.refresh_tools = _filtered_refresh
             tm._refresh_tools_patched = True
@@ -273,37 +298,85 @@ def _filter_tool_manager(
         logger.bind(tag=TAG).error(f"工具过滤失败: {e}")
 
 
-def _apply_tool_cache_filter(tm, allowed: FrozenSet[str], logger, TAG: str) -> None:
-    """对 ToolManager 当前缓存执行白名单过滤"""
+def _apply_tool_cache_filter(
+    tm,
+    allowed: FrozenSet[str],
+    logger,
+    TAG: str,
+    disallowed_tool_types: Optional[FrozenSet[str]] = None,
+) -> None:
+    """对 ToolManager 当前缓存执行白名单过滤
+
+    默认只过滤 SERVER_PLUGIN 类型的工具，保留其他工具；当显式传入
+    disallowed_tool_types 时，额外移除指定类型的工具，避免设备控制等能力
+    在项目限定模式下被错误暴露。
+    """
+    from core.providers.tools.base import ToolType
+
+    disallowed_tool_types = disallowed_tool_types or frozenset()
+
     all_tools = tm._cached_tools
     if all_tools is None:
-        # 缓存为空（尚未初始化），先触发填充
         all_tools = tm.get_all_tools()
-    
-    tools_to_remove = set(all_tools.keys()) - allowed
-    
+
+    plugin_tools = {
+        name for name, defn in all_tools.items()
+        if defn.tool_type == ToolType.SERVER_PLUGIN
+    }
+    other_tools = {
+        name for name, defn in all_tools.items()
+        if defn.tool_type != ToolType.SERVER_PLUGIN
+    }
+
+    tools_to_remove = plugin_tools - allowed
+
     if tools_to_remove:
         logger.bind(tag=TAG).info(
-            f"工具过滤: 移除 {len(tools_to_remove)} 个, "
-            f"保留 {len(allowed & set(all_tools.keys()))} 个"
+            f"工具过滤: 移除 {len(tools_to_remove)} 个插件工具, "
+            f"保留 {len(allowed & plugin_tools)} 个插件工具, "
+            f"保留其他工具 {len(other_tools)} 个"
         )
-        logger.bind(tag=TAG).debug(f"  移除: {sorted(tools_to_remove)}")
-    
-    # 过滤缓存
+    else:
+        logger.bind(tag=TAG).info(
+            f"工具过滤: 保留 {len(allowed & plugin_tools)} 个插件工具, "
+            f"保留其他工具 {len(other_tools)} 个"
+        )
+
+    # 1. 先按白名单过滤所有工具（保持与旧代码兼容的行为）
     filtered_tools = {
         name: definition
         for name, definition in all_tools.items()
         if name in allowed
     }
+
+    # 2. 将非 SERVER_PLUGIN 工具补回（除非其类型被明确禁用）
+    #    这是为了兼容 IoT/MCP 等设备端动态注册的工具，它们不应受项目白名单限制
+    non_plugin_added = 0
+    for name, definition in all_tools.items():
+        if name in filtered_tools:
+            continue
+        if definition.tool_type == ToolType.SERVER_PLUGIN:
+            continue
+        # 检查该工具类型是否在禁用列表中
+        if disallowed_tool_types and definition.tool_type.value in disallowed_tool_types:
+            continue
+        filtered_tools[name] = definition
+        non_plugin_added += 1
+
+    if non_plugin_added:
+        logger.bind(tag=TAG).info(
+            f"补回非插件工具 {non_plugin_added} 个: "
+            f"{sorted([n for n, d in filtered_tools.items() if d.tool_type != ToolType.SERVER_PLUGIN])}"
+        )
+
     tm._cached_tools = filtered_tools
-    
-    # 同步过滤函数描述缓存
+
     if tm._cached_function_descriptions is not None:
         tm._cached_function_descriptions = [
             desc for desc in tm._cached_function_descriptions
-            if desc.get("function", {}).get("name") in allowed
+            if desc.get("function", {}).get("name") in filtered_tools
         ]
-    
+
     remaining = list(filtered_tools.keys())
     logger.bind(tag=TAG).info(
         f"当前可用工具 ({len(remaining)}): {sorted(remaining)}"

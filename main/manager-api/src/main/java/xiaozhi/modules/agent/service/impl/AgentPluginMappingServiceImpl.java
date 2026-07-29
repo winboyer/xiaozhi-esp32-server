@@ -18,8 +18,10 @@ import xiaozhi.modules.agent.entity.AgentPluginMapping;
 import xiaozhi.modules.agent.service.AgentPluginMappingService;
 import xiaozhi.modules.knowledge.entity.KnowledgeBaseEntity;
 import xiaozhi.modules.knowledge.service.KnowledgeBaseService;
+import xiaozhi.modules.model.dto.ModelProviderDTO;
 import xiaozhi.modules.model.entity.ModelConfigEntity;
 import xiaozhi.modules.model.service.ModelConfigService;
+import xiaozhi.modules.model.service.ModelProviderService;
 
 /**
  * @description 针对表【ai_agent_plugin_mapping(Agent与插件的唯一映射表)】的数据库操作Service实现
@@ -33,6 +35,7 @@ public class AgentPluginMappingServiceImpl extends MpServiceImpl<AgentPluginMapp
     private final AgentPluginMappingMapper agentPluginMappingMapper;
     private final KnowledgeBaseService knowledgeBaseService;
     private final ModelConfigService modelConfigService;
+    private final ModelProviderService modelProviderService;
 
     @Override
     public List<AgentPluginMapping> agentPluginParamsByAgentId(String agentId) {
@@ -45,7 +48,18 @@ public class AgentPluginMappingServiceImpl extends MpServiceImpl<AgentPluginMapp
                 // 查询知识库插件参数
                 KnowledgeBaseEntity knowledgeBaseEntity = knowledgeBaseService.selectById(mapping.getPluginId());
                 if (knowledgeBaseEntity == null) {
-                    list.remove(i);
+                    // 非知识库插件：尝试从 ai_model_provider 表补全 providerCode
+                    // （SQL 子查询可能因数据迁移、表结构变更等原因返回 NULL）
+                    ModelProviderDTO providerDTO = modelProviderService.getById(mapping.getPluginId());
+                    if (providerDTO != null && StringUtils.isNotBlank(providerDTO.getProviderCode())) {
+                        mapping.setProviderCode(providerDTO.getProviderCode());
+                        log.info("补全插件 providerCode: pluginId={} → providerCode={}",
+                                mapping.getPluginId(), providerDTO.getProviderCode());
+                    } else {
+                        log.warn("插件映射无法解析 providerCode，已移除: pluginId={}, agentId={}",
+                                mapping.getPluginId(), agentId);
+                        list.remove(i);
+                    }
                     continue;
                 }
                 ModelConfigEntity modelConfigEntity = modelConfigService

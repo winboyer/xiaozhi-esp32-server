@@ -65,8 +65,8 @@ class ToolManager:
         return tool_name in tools
 
     def _normalize_tool_name(self, name: str) -> str:
-        """标准化工具名：移除下划线并转为小写，用于模糊匹配"""
-        return name.replace("_", "").replace("-", "").lower()
+        """标准化工具名：移除下划线、连字符和点号，并转为小写，用于模糊匹配"""
+        return name.replace("_", "").replace("-", "").replace(".", "").lower()
 
     def get_tool_type(self, tool_name: str) -> Optional[ToolType]:
         """获取工具类型"""
@@ -75,7 +75,7 @@ class ToolManager:
         return tool_def.tool_type if tool_def else None
 
     def _fuzzy_find_tool(self, tool_name: str) -> Optional[str]:
-        """模糊匹配工具名，当精确匹配失败时，尝试移除下划线等字符后匹配"""
+        """模糊匹配工具名，当精确匹配失败时，尝试移除下划线、连字符和点号后匹配"""
         tools = self.get_all_tools()
         normalized_input = self._normalize_tool_name(tool_name)
         for name in tools:
@@ -94,12 +94,17 @@ class ToolManager:
             # 查找工具类型（先精确匹配，再模糊匹配）
             tool_type = self.get_tool_type(tool_name)
             if not tool_type:
-                # 模糊匹配：LLM 可能漏掉下划线（如 analyzeweighbridgedata -> analyze_weighbridge_data）
+                # 模糊匹配：LLM 可能漏掉下划线、点号等分隔符（如 selfaudiospeakersetvolume -> self.audio_speaker.set_volume）
                 matched_name = self._fuzzy_find_tool(tool_name)
                 if matched_name:
                     tool_name = matched_name
                     tool_type = self.get_tool_type(tool_name)
             if not tool_type:
+                # 诊断日志：列出当前所有可用工具，帮助排查时序问题
+                available = self.get_supported_tool_names()
+                self.logger.warning(
+                    f"工具 '{tool_name}' 未找到。当前可用工具({len(available)}个): {sorted(available)}"
+                )
                 return ActionResponse(
                     action=Action.NOTFOUND,
                     response=f"工具 {tool_name} 不存在",

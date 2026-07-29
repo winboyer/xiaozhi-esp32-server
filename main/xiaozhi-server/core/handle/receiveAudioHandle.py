@@ -97,6 +97,28 @@ async def startToChat(conn: "ConnectionHandler", text):
     # 意图未被处理，继续常规聊天流程，使用实际文本内容
     await send_stt_message(conn, actual_text)
 
+    # 推送 ASR 事件到数字孪生平（仅对话流程）
+    asr_duration = getattr(conn, "_dt_asr_duration_ms", 0)
+    asr_backend = getattr(conn, "_dt_asr_backend", "")
+    text_raw = text  # 原始文本（可能包含 JSON 格式的说话人信息）
+    # 如果 text 是 JSON 格式，提取原始内容作为 raw_text
+    try:
+        if text.strip().startswith("{") and text.strip().endswith("}"):
+            data = json.loads(text)
+            if "content" in data:
+                text_raw = data.get("content", text)
+    except (json.JSONDecodeError, KeyError):
+        pass
+    conn._dt_push_asr(
+        text=actual_text,
+        text_raw=text_raw,
+        speaker_name=speaker_name,
+        asr_backend=asr_backend,
+        asr_duration_ms=asr_duration,
+    )
+    # 存储用户文本供 round_end 使用
+    conn._dt_last_user_text = actual_text
+
     # 准备开始新会话
     conn.client_abort = False
 
