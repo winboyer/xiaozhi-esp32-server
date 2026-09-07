@@ -67,7 +67,13 @@ async def _wait_for_audio_completion(conn: "ConnectionHandler"):
         conn.logger.bind(tag=TAG).debug(
             f"等待音频发送完成，队列中还有 {len(rate_controller.queue)} 个包"
         )
-        await rate_controller.queue_empty_event.wait()
+        # 带超时等待队列清空，避免后台发送任务异常时无限阻塞导致流程卡死
+        try:
+            await asyncio.wait_for(rate_controller.queue_empty_event.wait(), timeout=5.0)
+        except asyncio.TimeoutError:
+            conn.logger.bind(tag=TAG).warning(
+                f"等待音频队列清空超时(5s)，队列中仍有 {len(rate_controller.queue)} 个包未发送"
+            )
 
         # 等待预缓冲包播放完成
         # 前N个包直接发送，增加2个网络抖动包，需要额外等待它们在客户端播放完成
@@ -75,7 +81,10 @@ async def _wait_for_audio_completion(conn: "ConnectionHandler"):
         pre_buffer_playback_time = (PRE_BUFFER_COUNT + 2) * frame_duration_ms / 1000.0
         await asyncio.sleep(pre_buffer_playback_time)
 
-        conn.logger.bind(tag=TAG).debug("音频发送完成")
+        total_frames = getattr(conn, "audio_flow_control", {}).get("packet_count", 0)
+        conn.logger.bind(tag=TAG).debug(
+            f"音频发送完成: 共 {total_frames} 帧, 等待播放 {pre_buffer_playback_time:.2f}s"
+        )
 
 
 async def _send_to_mqtt_gateway(

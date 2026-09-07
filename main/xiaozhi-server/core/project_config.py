@@ -217,15 +217,14 @@ def apply_project_filter(conn: "ConnectionHandler") -> None:
     )
     
     if project == ProjectName.CHAOBAIHE:
-        # 潮白河：数据库查询模式，只保留通用工具，并关闭设备/外部MCP工具
+        # 潮白河：数据库查询模式，只保留通用工具 + 设备控制工具
+        # 设备端 IoT/MCP 工具（音量、亮度、状态等）为通用能力，不随项目禁用
         _filter_tool_manager(
             conn,
             _COMMON_FUNCTIONS,
             logger,
             TAG,
             disallowed_tool_types=frozenset({
-                "device_iot",
-                "device_mcp",
                 "mcp_endpoint",
                 "server_mcp",
             }),

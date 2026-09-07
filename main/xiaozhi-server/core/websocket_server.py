@@ -156,7 +156,13 @@ class WebSocketServer:
 
     async def _handle_digital_twin_connection(self, websocket: websockets.ServerConnection):
         """处理数字孪生平 WebSocket 连接"""
-        self.logger.bind(tag=TAG).info("数字孪生平台客户端已连接")
+        try:
+            headers = dict(websocket.request.headers)
+            real_ip = headers.get("x-real-ip") or headers.get("x-forwarded-for")
+            client_ip = real_ip.split(",")[0].strip() if real_ip else websocket.remote_address[0]
+        except Exception:
+            client_ip = "unknown"
+        self.logger.bind(tag=TAG).info(f"数字孪生平台客户端已连接, ip={client_ip}")
         handler = DigitalTwinHandler(websocket, self.dt_manager, self.logger)
         try:
             await handler.handle()

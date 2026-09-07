@@ -214,6 +214,7 @@ class ConnectionHandler:
         self._dt_sentence_id = None       # 当前数字孪生事件 sentence_id
         self._dt_intent_type = ""         # 当前意图类型
         self._dt_last_user_text = ""      # 上一轮用户文本（供 round_end 使用）
+        self._dt_has_dialogue = False     # 本轮是否有真实对话内容（唤醒词轮为 False，抑制 round_end 推送）
 
     async def handle_connection(self, ws: websockets.ServerConnection):
         try:
@@ -1156,8 +1157,9 @@ class ConnectionHandler:
                     content_type=ContentType.ACTION,
                 )
             )
-            # 重置数字孪生流式状态
-            self._dt_reset_stream_state(current_sentence_id, self.intent_type)
+            # 重置数字孪生流式状态（复用 startToChat 已生成的 sentence_id，保持与 asr 事件串联）
+            dt_sid = getattr(self, "_dt_sentence_id", None) or current_sentence_id
+            self._dt_reset_stream_state(dt_sid, self.intent_type)
         else:
             # 递归调用时，使用当前的sentence_id
             current_sentence_id = self.sentence_id
@@ -1652,6 +1654,7 @@ class ConnectionHandler:
         self._dt_cumulative_text = ""
         self._dt_sentence_id = sentence_id
         self._dt_intent_type = intent_type or ""
+        self._dt_has_dialogue = False
 
     def _dt_accumulate_text(self, content: str):
         """累积 LLM 文本并按句推送 llm_stream 到数字孪生平"""
@@ -1665,6 +1668,7 @@ class ConnectionHandler:
 
         self._dt_text_buffer += content
         self._dt_cumulative_text += content
+        self._dt_has_dialogue = True
 
         # 句子结束符（中英文）
         SENTENCE_ENDINGS = set("。！？；\n!?;")
@@ -1764,6 +1768,9 @@ class ConnectionHandler:
         if not self.server.dt_manager.has_subscribers(device_id):
             return
 
+        # 标记本轮有真实对话内容（唤醒词轮不调用本方法）
+        self._dt_has_dialogue = True
+
         project = self.config.get("project")
         project_str = project.value if hasattr(project, "value") else (project or "")
 
@@ -1798,6 +1805,10 @@ class ConnectionHandler:
         if not self.server.dt_manager.has_subscribers(device_id):
             return
 
+        # 唤醒词轮（无真实对话内容）不推送 round_end
+        if not self._dt_has_dialogue:
+            return
+
         project = self.config.get("project")
         project_str = project.value if hasattr(project, "value") else (project or "")
 
@@ -1824,6 +1835,36 @@ class ConnectionHandler:
         self._dt_schedule(
             self.server.dt_manager.push_event(device_id, event)
         )
+
+    def _dt_push_speak_text(self, text: str):
+        """推送意图处理流（speak_txt 播放内容）到数字孪生平
+
+        覆盖潮白河 DB 查询、天气、OTA 工具调用等不走 conn.chat() 的回答路径：
+        复用本轮的 _dt_sentence_id（与 asr 事件一致），按句推 llm_stream + llm_done。
+        """
+        if not text or not self.server or not hasattr(self.server, "dt_manager"):
+            return
+        device_id = self.device_id or ""
+        if not self.server.dt_manager.has_subscribers(device_id):
+            return
+
+        # 复用 asr 推送时已生成的 sentence_id；若没有则用当前 TTS sentence_id
+        if not self._dt_sentence_id:
+            self._dt_reset_stream_state(
+                self.sentence_id or str(uuid.uuid4().hex), self._dt_intent_type
+            )
+        else:
+            # 新的一轮回答，重置流式缓冲（保留 sentence_id 与 asr 串联）
+            self._dt_text_buffer = ""
+            self._dt_chunk_index = 0
+            self._dt_cumulative_text = ""
+
+        self._dt_accumulate_text(text)
+        # 冲刷剩余缓冲区
+        if self._dt_text_buffer.strip():
+            self._dt_push_stream_sentence(self._dt_text_buffer)
+            self._dt_text_buffer = ""
+        self._dt_push_llm_done()
 
     # ---------- 数字孪生推送方法结束 ----------
 

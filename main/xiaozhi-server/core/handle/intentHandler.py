@@ -22,6 +22,50 @@ _WEATHER_KEYWORDS = [
     "冷热", "冷不冷", "热不热", "会不会下雨",
 ]
 
+# 音量调整信号词（命中即调整，不命中再看查询信号）
+_VOLUME_ADJUST_KEYWORDS = [
+    "调大音量", "调小音量", "音量调", "调音量", "音量设", "设置音量", "音量改",
+    "加大音量", "减小音量", "提高音量", "降低音量", "音量加", "音量减",
+    "增大音量", "音量增加", "音量减少", "音量开大", "音量开小",
+    "调大", "调小", "调高", "调低", "声音调", "调声音", "音量高", "音量低",
+]
+# 音量查询信号词（命中即查询）
+_VOLUME_QUERY_KEYWORDS = [
+    "查询音量", "查音量", "音量多少", "音量几", "音量是", "声音多大", "音量多大",
+    "音量大小", "音量状态", "当前音量", "现在音量", "音量是多少", "声音大小",
+    "声音多少", "多大声音", "音量什么", "音量多少分贝", "声音大吗", "声音小吗",
+]
+# 亮度调整信号词
+_BRIGHTNESS_ADJUST_KEYWORDS = [
+    "调亮", "调暗", "亮度调", "调亮度", "亮度设", "设置亮度", "亮度改",
+    "提高亮度", "降低亮度", "亮度加", "亮度减", "亮度开大", "亮度开小",
+    "屏幕调", "调屏幕", "亮度高", "亮度低", "亮点", "暗点", "亮一些", "暗一些",
+]
+# 亮度查询信号词
+_BRIGHTNESS_QUERY_KEYWORDS = [
+    "查询亮度", "查亮度", "亮度多少", "亮度几", "亮度是", "亮度状态",
+    "当前亮度", "现在亮度", "亮度是多少", "屏幕亮度多少", "亮度多大",
+]
+
+# OTA 设备快速路由关键词 → 路由类型
+_OTA_FAST_ROUTE_KEYWORDS = {
+    # 设备信息/状态查询
+    "设备信息": "device_info", "设备状态": "device_info",
+    # 电量查询
+    "电量": "battery", "电池": "battery", "剩余电量": "battery",
+}
+
+# 快速路由类型 → 对应的 MCP 工具名
+# 查询类（音量/亮度）走 get_device_status，调整类才走 set_volume / set_brightness
+_FAST_ROUTE_TOOLS = {
+    "volume": "self.audio_speaker.set_volume",
+    "volume_query": "self.get_device_status",
+    "brightness": "self.screen.set_brightness",
+    "brightness_query": "self.get_device_status",
+    "device_info": "self.get_device_status",
+    "battery": "self.get_device_status",
+}
+
 TAG = __name__
 
 
@@ -63,11 +107,20 @@ async def handle_user_intent(conn: "ConnectionHandler", text):
     # ---- 潮白河项目：监测数据库查询模式 ----
     # 使用 DataQueryEngine 进行 SQL 数据查询，不走插件函数体系
     if hasattr(conn, "_chaobaihe_db_engine") and conn._chaobaihe_db_engine is not None:
+        # ---- 快速路由：天气/OTA 等通用查询直接走函数调用 ----
+        # （对齐 intent_api_server.py：快速路由跳过 LLM 意图分类）
+        route_type = _detect_chaobaihe_fast_route(text)
+        if route_type:
+            handled = await _handle_chaobaihe_fast_route(conn, text, route_type)
+            if handled:
+                return True
+            # 快速路由处理失败时继续往下（可能是工具未就绪）
+        
+        # ---- 非快速路由：LLM 意图理解 + DB 命中查询 ----
+        # （对齐 intent_api_server.py：classify_intent → DB 查询 → summarize_stream）
         handled = await _handle_chaobaihe_db_query(conn, text)
         if handled:
             return True
-        # DB 查询未命中时，继续走正常 LLM 对话流程
-        # （允许潮白河项目同时支持 DB 查询和普通对话）
 
     # 使用LLM进行意图分析（包括地磅数据查询、人员状态查询等）
     # LLM会根据function_call配置自动匹配并构造正确的HTTP请求参数
@@ -136,6 +189,25 @@ def _build_weather_intent() -> str:
             "arguments": {},
         }
     })
+
+
+# 常见城市名列表（用于从用户输入中提取城市，对齐 intent_api_server.py 的 detect_location）
+_COMMON_CITY_NAMES = [
+    "北京", "上海", "广州", "深圳", "杭州", "成都", "武汉", "南京", "重庆",
+    "西安", "天津", "苏州", "长沙", "郑州", "青岛", "大连", "厦门", "福州",
+    "合肥", "济南", "沈阳", "昆明", "贵阳", "南宁", "哈尔滨", "长春", "太原",
+    "石家庄", "南昌", "兰州", "海口", "拉萨", "乌鲁木齐", "呼和浩特", "银川", "西宁",
+]
+
+
+def _extract_city_from_text(text: str) -> str:
+    """从用户输入中提取城市名"""
+    if not text:
+        return ""
+    for city in _COMMON_CITY_NAMES:
+        if city in text:
+            return city
+    return ""
 
 
 async def check_direct_exit(conn: "ConnectionHandler", text):
@@ -310,6 +382,10 @@ async def process_intent_result(
 
 
 def speak_txt(conn: "ConnectionHandler", text):
+    # 数字孪生推送意图处理结果（潮白河 DB 查询 / 天气 / OTA 工具调用等不走 conn.chat() 的回答）
+    if text:
+        conn._dt_push_speak_text(text)
+
     # 记录文本到 sentence_id 映射
     conn.tts.store_tts_text(conn.sentence_id, text)
 
@@ -331,6 +407,146 @@ def speak_txt(conn: "ConnectionHandler", text):
     conn.dialogue.put(Message(role="assistant", content=text))
 
 
+# ==================== 潮白河项目：快速路由（天气 + OTA 设备控制/查询） ====================
+
+def _detect_chaobaihe_fast_route(text: str) -> str:
+    """检测用户输入是否命中快速路由（天气/OTA设备控制/查询）
+    
+    Returns:
+        路由类型字符串（"weather" / "volume" / "volume_query" / "brightness" / "brightness_query" / "device_info" / "battery"）
+        空字符串表示未命中快速路由
+    """
+    if not text:
+        return ""
+    
+    # 天气快速路由
+    if _is_weather_query(text):
+        return "weather"
+    
+    # 音量路由：先判断调整信号，再判断查询信号；只有"音量/声音"无明确信号时默认查询（避免误调设备）
+    if "音量" in text or "声音" in text:
+        for kw in _VOLUME_ADJUST_KEYWORDS:
+            if kw in text:
+                return "volume"
+        for kw in _VOLUME_QUERY_KEYWORDS:
+            if kw in text:
+                return "volume_query"
+        # 无明确调整信号 → 默认查询
+        return "volume_query"
+    
+    # 亮度路由
+    if "亮度" in text or "屏幕" in text:
+        for kw in _BRIGHTNESS_ADJUST_KEYWORDS:
+            if kw in text:
+                return "brightness"
+        for kw in _BRIGHTNESS_QUERY_KEYWORDS:
+            if kw in text:
+                return "brightness_query"
+        # 无明确调整信号 → 默认查询
+        return "brightness_query"
+    
+    # 其他 OTA 设备快速路由（设备信息/电量）
+    text_lower = text.lower()
+    for kw, route_type in _OTA_FAST_ROUTE_KEYWORDS.items():
+        if kw in text_lower:
+            return route_type
+    
+    return ""
+
+
+async def _handle_chaobaihe_fast_route(conn: "ConnectionHandler", text: str, route_type: str) -> bool:
+    """潮白河项目快速路由统一入口
+    
+    Args:
+        route_type: 路由类型（"weather" / "volume" / "brightness" / "device_info" / "battery"）
+    """
+    if route_type == "weather":
+        return await _handle_chaobaihe_weather(conn, text)
+    
+    # OTA 设备类快速路由
+    tool_name = _FAST_ROUTE_TOOLS.get(route_type)
+    if not tool_name:
+        return False
+    
+    # 检查工具是否可用
+    if not _has_tool(conn, tool_name):
+        conn.logger.bind(tag=TAG).warning(f"快速路由 {route_type} 工具 {tool_name} 不可用")
+        return False
+    
+    conn.logger.bind(tag=TAG).info(f"潮白河快速路由 {route_type} → {tool_name}: {text}")
+    await send_stt_message(conn, text)
+    conn.client_abort = False
+    conn.sentence_id = str(uuid.uuid4().hex)
+    
+    # 简单参数提取（音量/亮度数值）
+    args = _extract_ota_args(text, route_type)
+    function_call_data = {
+        "name": tool_name,
+        "id": str(uuid.uuid4().hex),
+        "arguments": json.dumps(args),
+    }
+    
+    # 在线程池中执行
+    def process_ota():
+        conn.dialogue.put(Message(role="user", content=text))
+        try:
+            result = asyncio.run_coroutine_threadsafe(
+                conn.func_handler.handle_llm_function_call(conn, function_call_data),
+                conn.loop,
+            ).result(timeout=30)
+        except Exception as e:
+            conn.logger.bind(tag=TAG).error(f"OTA 快速路由 {route_type} 调用失败: {e}")
+            speak_txt(conn, f"设备{route_type}操作暂时不可用，请稍后再试")
+            return
+        
+        if result and result.action == Action.REQLLM:
+            llm_result = conn.intent.replyResult(result.result, text)
+            speak_txt(conn, llm_result or str(result.result))
+        elif result and result.response:
+            speak_txt(conn, result.response)
+        elif result and result.result:
+            speak_txt(conn, str(result.result))
+        else:
+            speak_txt(conn, "操作已完成")
+    
+    conn.executor.submit(process_ota)
+    return True
+
+
+def _extract_ota_args(text: str, route_type: str) -> dict:
+    """从用户输入中提取 OTA 工具参数"""
+    args = {}
+    
+    if route_type == "volume":
+        # 音量数值提取: "音量调到50", "音量50%"
+        m = re.search(r'(\d+)\s*(?:%|百分之)?', text)
+        if m:
+            args["volume"] = int(m.group(1))
+    elif route_type == "brightness":
+        # 亮度数值提取: "亮度调到80", "亮度50%"
+        m = re.search(r'(\d+)\s*(?:%|百分之)?', text)
+        if m:
+            args["brightness"] = int(m.group(1))
+    
+    return args
+
+
+def _has_tool(conn: "ConnectionHandler", tool_name: str) -> bool:
+    """检查工具是否可用（模糊匹配，兼容下划线/点号变化）"""
+    try:
+        tools = conn.func_handler.tool_manager.get_all_tools()
+        if tool_name in tools:
+            return True
+        # 模糊匹配
+        sanitized = tool_name.replace(".", "").replace("_", "").lower()
+        for name in tools:
+            if name.replace(".", "").replace("_", "").lower() == sanitized:
+                return True
+        return False
+    except Exception:
+        return False
+
+
 # ==================== 潮白河项目：监测数据库查询 ====================
 
 # DB 查询关键词（用于快速判断是否走 DB 查询路径，避免每次都调 LLM 分类）
@@ -342,31 +558,90 @@ _DB_QUERY_KEYWORDS = [
     "时差", "超声波", "水位", "断面",
     "监测", "传感器", "设备数据", "统计", "概览", "总览", "概况",
     "数据", "查询", "异常", "告警", "阈值",
+    # 以下为潮白河测试问题中出现的分析类关键词，避免漏过滤
+    "安全", "评估", "电量", "趋势", "响应",
+    "电压", "状态", "维护", "风险", "沉降",
+    "分区", "安全等级", "加速", "减缓", "同步",
+    "坝体", "变化", "当前值", "当前", "最大", "最小",
 ]
 
 
+async def _handle_chaobaihe_weather(conn: "ConnectionHandler", text: str) -> bool:
+    """潮白河项目：天气查询直接调用 get_weather 函数
+    
+    function_call 意图提供者永远返回 continue_chat，不依赖 LLM 匹配，
+    因此天气等通用查询需要在 DB 查询未命中后直接调用对应函数。
+    """
+    if not _has_weather_function(conn):
+        conn.logger.bind(tag=TAG).info(f"天气查询但未配置 get_weather 接口: {text}")
+        await send_stt_message(conn, text)
+        conn.client_abort = False
+        conn.sentence_id = str(uuid.uuid4().hex)
+        speak_txt(conn, "暂时无法查询今天天气")
+        return True
+    
+    conn.logger.bind(tag=TAG).info(f"潮白河天气查询，直接调用 get_weather: {text}")
+    await send_stt_message(conn, text)
+    conn.client_abort = False
+    conn.sentence_id = str(uuid.uuid4().hex)
+    
+    # 从用户输入中提取城市名（对齐 intent_api_server.py 的 detect_location）
+    city = _extract_city_from_text(text)
+    weather_args = {"location": city} if city else {}
+    function_call_data = {
+        "name": "get_weather",
+        "id": str(uuid.uuid4().hex),
+        "arguments": json.dumps(weather_args),
+    }
+    
+    # 在线程池中执行函数调用
+    def process_weather():
+        conn.dialogue.put(Message(role="user", content=text))
+        try:
+            result = asyncio.run_coroutine_threadsafe(
+                conn.func_handler.handle_llm_function_call(conn, function_call_data),
+                conn.loop,
+            ).result(timeout=30)
+        except Exception as e:
+            conn.logger.bind(tag=TAG).error(f"get_weather 调用失败: {e}")
+            speak_txt(conn, "天气查询暂时不可用，请稍后再试")
+            return
+        
+        if result and result.action == Action.REQLLM:
+            # 天气数据需要 LLM 润色
+            llm_result = conn.intent.replyResult(result.result, text)
+            speak_txt(conn, llm_result or result.result)
+        elif result and result.response:
+            speak_txt(conn, result.response)
+        elif result and result.result:
+            speak_txt(conn, str(result.result))
+        else:
+            speak_txt(conn, "天气查询暂时不可用")
+    
+    conn.executor.submit(process_weather)
+    return True
+
+
 async def _handle_chaobaihe_db_query(conn: "ConnectionHandler", text: str) -> bool:
-    """潮白河项目：监测数据库查询处理
+    """潮白河项目：监测数据库查询处理（对齐 intent_api_server.py）
     
     使用 DataQueryEngine + LLM 进行意图分类 → 数据查询 → 智能总结。
     
     流程：
-    1. 关键词预判：快速判断用户查询是否与 DB 数据相关
-    2. LLM 意图分类：确定查询目标和数据表
-    3. DataQueryEngine 查询：执行数据查询
-    4. LLM 智能总结：对查询结果进行统计分析和自然语言总结
+    1. LLM 意图分类：确定是否 DB 查询、选表
+    2. 关键词匹配字段
+    3. DataQueryEngine 提取数据
+    4. LLM 流式总结（summarize_stream）
+    
+    Note: 快速路由（天气/OTA）已在 handle_user_intent 中优先处理，
+          此处只处理 DB 相关查询。
     
     Returns:
-        True: DB 查询已处理
-        False: 非 DB 查询，应走正常 LLM 对话流程
+        True: 查询已处理（DB 查询或已返回提示）
+        False: LLM 分类异常，应降级到普通对话
     """
     engine = conn._chaobaihe_db_engine
     if engine is None:
-        return False
-    
-    # 1. 关键词预判：快速过滤明显非 DB 的查询
-    if not _is_likely_db_query(text):
-        conn.logger.bind(tag=TAG).debug(f"潮白河: 非DB查询，走正常对话: {text}")
         return False
     
     conn.logger.bind(tag=TAG).info(f"潮白河 DB 查询: {text}")
@@ -388,6 +663,8 @@ async def _handle_chaobaihe_db_query(conn: "ConnectionHandler", text: str) -> bo
                 build_context_for_llm,
                 match_intent,
                 summarize_stream,
+                _normalize_table_list,
+                METRIC_KEYWORDS,
             )
             _has_intent_api = True
         except ImportError:
@@ -395,7 +672,7 @@ async def _handle_chaobaihe_db_query(conn: "ConnectionHandler", text: str) -> bo
             conn.logger.bind(tag=TAG).warning("无法导入 intent_api_server，使用简化 DB 查询")
         
         if _has_intent_api:
-            # --- 使用 intent_api_server 的完整流程 ---
+            # --- 使用 intent_api_server 的完整流程（对齐 HTTP API /api/v1/intent/analyze） ---
             # LLM 分类：确定查询哪些表（同步 HTTP 调用，必须在 executor 中运行，避免阻塞事件循环）
             def do_classify():
                 return classify_intent(text, engine)
@@ -403,21 +680,45 @@ async def _handle_chaobaihe_db_query(conn: "ConnectionHandler", text: str) -> bo
             classification = await asyncio.get_event_loop().run_in_executor(
                 conn.executor, do_classify
             )
+            
+            if not isinstance(classification, dict):
+                classification = {"cat": "other", "tbls": []}
+            
             cat = classification.get("cat", "other")
             
             if cat != "db":
-                conn.logger.bind(tag=TAG).debug(
-                    f"潮白河: LLM 分类为非 DB 查询 (cat={cat})，走正常对话"
-                )
-                return False
+                # 对齐 HTTP API：非DB意图返回明确提示，而不是降级到普通对话
+                await send_stt_message(conn, text)
+                conn.client_abort = False
+                conn.sentence_id = str(uuid.uuid4().hex)
+                msg = f"当前仅支持数据库查询。您的意图为「{cat}」，暂不支持。"
+                conn.logger.bind(tag=TAG).debug(f"潮白河: 非DB意图 -> {msg}")
+                speak_txt(conn, msg)
+                return True
             
-            tables = classification.get("tbls", [])
+            # 规范化 LLM 返回的表名列表
+            tables = _normalize_table_list(classification.get("tbls", []), engine)
+            conn.logger.bind(tag=TAG).info(f"潮白河 LLM 分类结果: cat={cat}, tbls={tables}")
+            
+            # 表名 fallback：LLM 没选出表时用关键词匹配兜底
             if not tables:
-                tables = list(engine.all_stats.keys())
+                kw_match = match_intent(text, engine)
+                tables = kw_match.get("tables", [])
+                if not tables:
+                    tables = list(engine.all_stats.keys())
+                conn.logger.bind(tag=TAG).info(f"潮白河 表名 fallback: tbls={tables}")
             
-            # 关键词匹配：确定关注的指标字段
+            # ---- 关键词匹配字段（对齐 HTTP API，使用 METRIC_KEYWORDS）----
+            matched_fields = []
+            for kw, (tname, field) in METRIC_KEYWORDS.items():
+                if kw in text:
+                    matched_fields.append(field)
+            
+            # 同时也用 match_intent 的 metrics 结果补充
             matched = match_intent(text, engine)
-            matched_fields = [m[1] for m in matched.get("metrics", []) if m[1]]
+            for m in matched.get("metrics", []):
+                if m[1] and m[1] not in matched_fields:
+                    matched_fields.append(m[1])
             
             # LLM 流式总结（在 executor 中运行以生成完整文本）
             def generate_summary():
@@ -432,6 +733,9 @@ async def _handle_chaobaihe_db_query(conn: "ConnectionHandler", text: str) -> bo
             )
             
             if summary:
+                await send_stt_message(conn, text)
+                conn.client_abort = False
+                conn.sentence_id = str(uuid.uuid4().hex)
                 speak_txt(conn, summary)
                 return True
             else:
@@ -455,6 +759,9 @@ async def _handle_chaobaihe_db_query(conn: "ConnectionHandler", text: str) -> bo
             )
             
             if result:
+                await send_stt_message(conn, text)
+                conn.client_abort = False
+                conn.sentence_id = str(uuid.uuid4().hex)
                 speak_txt(conn, result)
                 return True
             

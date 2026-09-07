@@ -1,11 +1,12 @@
 import time
 import json
+import uuid
 import asyncio
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from core.connection import ConnectionHandler
-from core.utils.util import audio_to_data
+from core.utils.util import audio_to_data, remove_punctuation_and_length
 from core.handle.abortHandle import handleAbortMessage
 from core.handle.intentHandler import handle_user_intent
 from core.utils.output_counter import check_device_output_limit
@@ -87,6 +88,40 @@ async def startToChat(conn: "ConnectionHandler", text):
     if conn.client_is_speaking and conn.client_listen_mode != "manual":
         await handleAbortMessage(conn)
 
+    # ---- 生成本轮 sentence_id（数字孪生事件串联：asr → llm → round_end 共享）----
+    conn.sentence_id = str(uuid.uuid4().hex)
+    conn._dt_sentence_id = conn.sentence_id
+    # 重置本轮对话标志（唤醒词轮保持 False，抑制 round_end 推送）
+    conn._dt_has_dialogue = False
+
+    # ---- 判断是否为唤醒词（唤醒词不作为数字孪生推送内容）----
+    _, filtered_text = remove_punctuation_and_length(actual_text)
+    is_wakeup_word = filtered_text in conn.config.get("wakeup_words", [])
+
+    # ---- 推送 ASR 事件到数字孪生平 ----
+    # 提前到意图分析之前，确保 ASR 结果无论是否被意图处理都推送到数字孪生平（唤醒词除外）
+    if not is_wakeup_word:
+        asr_duration = getattr(conn, "_dt_asr_duration_ms", 0)
+        asr_backend = getattr(conn, "_dt_asr_backend", "")
+        text_raw = text  # 原始文本（可能包含 JSON 格式的说话人信息）
+        # 如果 text 是 JSON 格式，提取原始内容作为 raw_text
+        try:
+            if text.strip().startswith("{") and text.strip().endswith("}"):
+                data = json.loads(text)
+                if "content" in data:
+                    text_raw = data.get("content", text)
+        except (json.JSONDecodeError, KeyError):
+            pass
+        conn._dt_push_asr(
+            text=actual_text,
+            text_raw=text_raw,
+            speaker_name=speaker_name,
+            asr_backend=asr_backend,
+            asr_duration_ms=asr_duration,
+        )
+        # 存储用户文本供 round_end 使用
+        conn._dt_last_user_text = actual_text
+
     # 首先进行意图分析，使用实际文本内容
     intent_handled = await handle_user_intent(conn, actual_text)
 
@@ -96,28 +131,6 @@ async def startToChat(conn: "ConnectionHandler", text):
 
     # 意图未被处理，继续常规聊天流程，使用实际文本内容
     await send_stt_message(conn, actual_text)
-
-    # 推送 ASR 事件到数字孪生平（仅对话流程）
-    asr_duration = getattr(conn, "_dt_asr_duration_ms", 0)
-    asr_backend = getattr(conn, "_dt_asr_backend", "")
-    text_raw = text  # 原始文本（可能包含 JSON 格式的说话人信息）
-    # 如果 text 是 JSON 格式，提取原始内容作为 raw_text
-    try:
-        if text.strip().startswith("{") and text.strip().endswith("}"):
-            data = json.loads(text)
-            if "content" in data:
-                text_raw = data.get("content", text)
-    except (json.JSONDecodeError, KeyError):
-        pass
-    conn._dt_push_asr(
-        text=actual_text,
-        text_raw=text_raw,
-        speaker_name=speaker_name,
-        asr_backend=asr_backend,
-        asr_duration_ms=asr_duration,
-    )
-    # 存储用户文本供 round_end 使用
-    conn._dt_last_user_text = actual_text
 
     # 准备开始新会话
     conn.client_abort = False

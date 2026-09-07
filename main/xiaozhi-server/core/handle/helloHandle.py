@@ -107,8 +107,8 @@ async def checkWakeupWords(conn: "ConnectionHandler", text):
             "text": "我在这里哦！",
         }
 
-    # 获取音频数据
-    opus_packets = await audio_to_data(response.get("file_path"), use_cache=False)
+    # 获取音频数据（使用缓存，避免每次唤醒都重新解码编码，提升唤醒响应速度）
+    opus_packets = await audio_to_data(response.get("file_path"), use_cache=True)
     # 播放唤醒词回复
     conn.client_abort = False
 
