@@ -66,6 +66,8 @@ _FAST_ROUTE_TOOLS = {
     "battery": "self.get_device_status",
 }
 
+_GATE_PLAN_KEYWORDS = ["开度方案", "闸门开度", "闸孔开度", "兴各庄闸", "泄洪方案", "闸门调度方案"]
+
 TAG = __name__
 
 
@@ -104,6 +106,12 @@ async def handle_user_intent(conn: "ConnectionHandler", text):
     if await checkWakeupWords(conn, filtered_text):
         return True
 
+    # 潮白河闸门方案暂不依赖 SQL 数据源，只基于用户提供的工程参数计算。
+    if _is_gate_opening_plan_query(text):
+        handled = await _handle_gate_opening_plan(conn, text)
+        if handled:
+            return True
+
     # ---- 潮白河项目：监测数据库查询模式 ----
     # 使用 DataQueryEngine 进行 SQL 数据查询，不走插件函数体系
     if hasattr(conn, "_chaobaihe_db_engine") and conn._chaobaihe_db_engine is not None:
@@ -115,7 +123,7 @@ async def handle_user_intent(conn: "ConnectionHandler", text):
             if handled:
                 return True
             # 快速路由处理失败时继续往下（可能是工具未就绪）
-        
+
         # ---- 非快速路由：LLM 意图理解 + DB 命中查询 ----
         # （对齐 intent_api_server.py：classify_intent → DB 查询 → summarize_stream）
         handled = await _handle_chaobaihe_db_query(conn, text)
@@ -452,6 +460,56 @@ def _detect_chaobaihe_fast_route(text: str) -> str:
             return route_type
     
     return ""
+
+
+def _is_gate_opening_plan_query(text: str) -> bool:
+    text_lower = (text or "").lower()
+    return any(keyword.lower() in text_lower for keyword in _GATE_PLAN_KEYWORDS)
+
+
+async def _handle_gate_opening_plan(conn: "ConnectionHandler", text: str) -> bool:
+    """生成兴各庄闸开度建议；不读取SQL，也不调用闸门控制MCP。"""
+    try:
+        import sys
+        import os
+        project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../.."))
+        if project_root not in sys.path:
+            sys.path.insert(0, project_root)
+        from intent_api_server import (
+            build_gate_opening_plan_prompt,
+            calculate_gate_opening_scenarios,
+            format_gate_opening_analysis_process,
+        )
+
+        from intent_api_server import extract_gate_plan_parameters
+        params = extract_gate_plan_parameters(text)
+        calculation = calculate_gate_opening_scenarios(
+            params["target_flow"], params["flow_coefficient"], params["gate_width"],
+            params["head"], params["gate_height"], params["minimum_opening"], params["flood_flow"],
+        )
+        analysis_process = format_gate_opening_analysis_process(calculation)
+        prompt = build_gate_opening_plan_prompt(text, calculation)
+
+        def generate():
+            # 估算模式使用确定性七段式输出，避免 LLM 改写数值或漏掉安全边界。
+            if calculation.get("mode") == "estimate":
+                return analysis_process
+            if not getattr(conn.intent, "llm", None):
+                return json.dumps(calculation, ensure_ascii=False)
+            return conn.intent.llm.response_no_stream(system_prompt=prompt, user_prompt="请输出开度方案。")
+
+        summary = await asyncio.get_event_loop().run_in_executor(conn.executor, generate)
+        output = analysis_process if calculation.get("mode") == "estimate" else analysis_process
+        if calculation.get("mode") != "estimate" and summary and summary.strip() != json.dumps(calculation, ensure_ascii=False):
+            output += "\n\n【分析结论】\n" + summary.strip()
+        await send_stt_message(conn, text)
+        conn.client_abort = False
+        conn.sentence_id = str(uuid.uuid4().hex)
+        speak_txt(conn, output)
+        return True
+    except Exception as e:
+        conn.logger.bind(tag=TAG).error(f"闸门开度方案生成失败: {e}")
+        return False
 
 
 async def _handle_chaobaihe_fast_route(conn: "ConnectionHandler", text: str, route_type: str) -> bool:

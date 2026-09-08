@@ -24,6 +24,7 @@ class ProjectName(str, Enum):
     SANYUANLI = "三元里"          # 人员状态（定位）+ 地磅数据
     JIANGJUNCI = "将军祠"         # 三元里之外的所有数据接口
     CHAOBAIHE = "潮白河"           # 数据库查询（监测数据）
+    XIANGYANGCUN = "向阳村"        # 塔机历史作业状态 + 人员数据查询
 
     @classmethod
     def from_string(cls, name: str) -> Optional["ProjectName"]:
@@ -78,6 +79,12 @@ _JIANGJUNCI_FUNCTIONS: FrozenSet[str] = frozenset({
 # 使用 intent_api_server 的 DataQueryEngine 进行监测数据查询
 _CHAOBAIHE_FUNCTIONS: FrozenSet[str] = frozenset()
 
+# 向阳村项目：塔机历史作业状态 + 人员数据查询
+_XIANGYANGCUN_FUNCTIONS: FrozenSet[str] = frozenset({
+    "query_taji_work_status",         # 塔机历史作业状态查询
+    "query_xiangyangcun_personnel",   # 向阳村项目人员数据查询
+})
+
 # 通用工具函数（所有项目都需要的非数据接口工具）
 _COMMON_FUNCTIONS: FrozenSet[str] = frozenset({
     "handle_exit_intent",         # 退出会话
@@ -93,6 +100,7 @@ PROJECT_FUNCTION_GROUPS: Dict[ProjectName, FrozenSet[str]] = {
     ProjectName.SANYUANLI: _SANYUANLI_FUNCTIONS,
     ProjectName.JIANGJUNCI: _JIANGJUNCI_FUNCTIONS,
     ProjectName.CHAOBAIHE: _CHAOBAIHE_FUNCTIONS,
+    ProjectName.XIANGYANGCUN: _XIANGYANGCUN_FUNCTIONS,
 }
 
 # 项目描述（用于日志和帮助信息）
@@ -100,6 +108,7 @@ PROJECT_DESCRIPTIONS: Dict[ProjectName, str] = {
     ProjectName.SANYUANLI: "人员定位 + 地磅数据 + 车牌分析",
     ProjectName.JIANGJUNCI: "施工数据接口（设备/告警/物资/塔机/电梯/人员分析）",
     ProjectName.CHAOBAIHE: "监测数据库查询（测缝计/GNSS/渗压计/流量计等）",
+    ProjectName.XIANGYANGCUN: "塔机历史作业状态 + 人员数据查询",
 }
 
 # ==================== staff_safe_query API 级别隔离 ====================

@@ -31,13 +31,28 @@ class DigitalTwinHandler:
         self.manager = manager
         self.logger = logger
         self.session_id = str(uuid.uuid4())
+        self.client_ip = self._resolve_client_ip(websocket)
         self._last_activity = asyncio.get_event_loop().time()
         self._alive = True
+
+    def _resolve_client_ip(self, websocket: websockets.ServerConnection) -> str:
+        """解析客户端 IP（优先取反代头 x-real-ip / x-forwarded-for，否则取 socket 地址）"""
+        try:
+            headers = dict(websocket.request.headers)
+            real_ip = headers.get("x-real-ip") or headers.get("x-forwarded-for")
+            if real_ip:
+                return real_ip.split(",")[0].strip()
+            return websocket.remote_address[0]
+        except Exception:
+            return "unknown"
 
     async def handle(self):
         """主消息循环"""
         # 发送欢迎消息
         await self._send_welcome()
+        self.logger.bind(tag=TAG).info(
+            f"数字孪生客户端已连接, ip={self.client_ip}, session_id={self.session_id}"
+        )
 
         try:
             async for raw_message in self.websocket:
@@ -99,6 +114,11 @@ class DigitalTwinHandler:
 
         project = message.get("project")
         count = await self.manager.subscribe(self, device_ids, project)
+
+        self.logger.bind(tag=TAG).info(
+            f"数字孪生客户端订阅完成: ip={self.client_ip}, "
+            f"device_ids={device_ids}, project={project or '无'}"
+        )
 
         await self.websocket.send(
             json.dumps(
@@ -164,6 +184,9 @@ class DigitalTwinHandler:
         """清理资源"""
         self._alive = False
         await self.manager.remove_handler(self)
+        self.logger.bind(tag=TAG).info(
+            f"数字孪生客户端断开连接, ip={self.client_ip}, session_id={self.session_id}"
+        )
         try:
             await self.websocket.close()
         except Exception:

@@ -9,12 +9,14 @@
     三元里 - 人员状态（定位）+ 地磅数据分析
     将军祠 - 施工数据接口（设备/进度/人员/塔机/车牌等）
     潮白河 - 监测数据库查询（测缝计/GNSS/渗压计/流量计等）
+    向阳村 - 塔机历史作业状态查询
 
 示例：
     python app.py                        # 普通 LLM 对话模式
     python app.py --project 三元里       # 三元里项目模式
     python app.py -p 将军祠              # 将军祠项目模式
     python app.py -p 潮白河              # 潮白河项目模式
+    python app.py -p 向阳村              # 向阳村项目模式
 """
 
 import sys
@@ -46,6 +48,7 @@ def parse_args() -> argparse.Namespace:
             f"  三元里    - {PROJECT_DESCRIPTIONS.get(ProjectName.SANYUANLI, '')}\n"
             f"  将军祠    - {PROJECT_DESCRIPTIONS.get(ProjectName.JIANGJUNCI, '')}\n"
             f"  潮白河    - {PROJECT_DESCRIPTIONS.get(ProjectName.CHAOBAIHE, '')}\n"
+            f"  向阳村    - {PROJECT_DESCRIPTIONS.get(ProjectName.XIANGYANGCUN, '')}\n"
             "\n不指定 --project 时，启动普通 LLM 对话服务（不进行数据接口/数据库调用）。"
         ),
     )

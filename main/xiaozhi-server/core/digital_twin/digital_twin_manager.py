@@ -52,7 +52,8 @@ class DigitalTwinManager:
                     self._sequences[did] = 0
                 subscribed_count += 1
             self.logger.bind(tag=TAG).info(
-                f"数字孪生客户端订阅 {subscribed_count} 台设备, "
+                f"数字孪生客户端[{getattr(handler, 'client_ip', 'unknown')}] "
+                f"订阅 {subscribed_count} 台设备, "
                 f"当前活跃连接: {len(self._handlers)}, "
                 f"当前订阅设备: {len(self._subscriptions)}"
             )
@@ -102,7 +103,8 @@ class DigitalTwinManager:
                 if not self._subscriptions[did]:
                     del self._subscriptions[did]
             self.logger.bind(tag=TAG).info(
-                f"数字孪生客户端断开, 剩余连接: {len(self._handlers)}"
+                f"数字孪生客户端[{getattr(handler, 'client_ip', 'unknown')}] 断开, "
+                f"剩余连接: {len(self._handlers)}, 剩余订阅设备: {len(self._subscriptions)}"
             )
 
     async def push_event(self, device_id: str, event: dict):

@@ -291,11 +291,26 @@ class ConnectionHandler:
                         f"强制关闭连接时出错: {close_error}"
                     )
 
+    def _has_real_dialogue(self) -> bool:
+        """判断会话是否有真实对话内容，用于跳过空会话的标题生成"""
+        try:
+            messages = getattr(self.dialogue, "dialogue", None) or []
+            for msg in messages:
+                # 排除系统提示与临时消息（唤醒词、few-shot 示例、工具提醒）
+                if getattr(msg, "role", None) == "user" and not getattr(msg, "is_temporary", False):
+                    content = getattr(msg, "content", None) or ""
+                    if content.strip():
+                        return True
+            return False
+        except Exception:
+            return False
+
     async def _save_and_close(self, ws):
         """保存记忆并关闭连接"""
         try:
             # 守护线程1：独立生成标题（不依赖记忆模型）
-            if self.session_id:
+            # 仅当会话存在真实对话内容时才触发标题生成，避免空会话产生无效 API 调用
+            if self.session_id and self._has_real_dialogue():
                 def generate_title_task():
                     try:
                         loop = asyncio.new_event_loop()

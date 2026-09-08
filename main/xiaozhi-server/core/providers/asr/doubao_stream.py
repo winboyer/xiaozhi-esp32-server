@@ -233,6 +233,22 @@ class ASRProvider(ASRProviderBase):
                             logger.bind(tag=TAG).error(f"ASR服务返回错误: {error_msg}")
                             break
 
+                except asyncio.TimeoutError:
+                    # ASR 服务在超时时间内未返回数据包（静音段/网络抖动常见）
+                    logger.bind(tag=TAG).warning(
+                        "ASR服务响应超时（8秒无数据包），结束本次识别会话"
+                    )
+                    # 若本地已检测到语音结束但服务端未返回结果，兜底触发识别，避免丢结果
+                    if conn.client_voice_stop and len(conn.asr_audio) > 15:
+                        logger.bind(tag=TAG).info(
+                            "ASR超时但本地语音已结束，触发兜底识别"
+                        )
+                        await self.handle_voice_stop(conn, conn.asr_audio)
+                    else:
+                        # 无待处理语音，优雅关闭连接（先发结束帧再关闭）
+                        await self._safe_close()
+                    self.is_processing = False
+                    break
                 except websockets.ConnectionClosed:
                     logger.bind(tag=TAG).info("ASR服务连接已关闭")
                     self.is_processing = False
@@ -259,10 +275,34 @@ class ASRProvider(ASRProviderBase):
 
     def stop_ws_connection(self):
         if self.asr_ws:
-            asyncio.create_task(self.asr_ws.close())
+            # 先发送结束帧再关闭，让服务端优雅结束，避免服务端长时间等待触发客户端超时
+            asyncio.create_task(self._safe_close(self.asr_ws))
             self.asr_ws = None
         self.is_processing = False
         self._is_stopping = False
+
+    async def _safe_close(self, ws=None):
+        """优雅关闭 ASR 连接：先发送结束标记帧，再关闭连接"""
+        ws = ws or self.asr_ws
+        self.asr_ws = None
+        if ws is None:
+            return
+        self._is_stopping = True
+        try:
+            # 发送结束标记的音频帧（gzip压缩的空数据）
+            empty_payload = gzip.compress(b"")
+            last_audio_request = bytearray(self.generate_last_audio_default_header())
+            last_audio_request.extend(len(empty_payload).to_bytes(4, "big"))
+            last_audio_request.extend(empty_payload)
+            await ws.send(last_audio_request)
+            logger.bind(tag=TAG).debug("已发送结束音频帧")
+        except Exception as e:
+            logger.bind(tag=TAG).debug(f"发送结束音频帧时出错: {e}")
+        finally:
+            try:
+                await ws.close()
+            except Exception:
+                pass
 
     async def _send_stop_request(self):
         """发送最后一个音频帧以通知服务器结束"""
