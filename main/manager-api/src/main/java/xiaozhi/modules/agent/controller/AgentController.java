@@ -77,15 +77,6 @@ public class AgentController {
         }
     }
 
-    private String requireSessionAgent(String sessionId) {
-        String agentId = agentChatHistoryService.getAgentIdBySessionId(sessionId);
-        if (StringUtils.isBlank(agentId)) {
-            throw new RenException(ErrorCode.AGENT_NOT_FOUND);
-        }
-        agentService.getAgentById(agentId);
-        return agentId;
-    }
-
     private String requireAudioPermission(String audioId) {
         String agentId = agentChatHistoryService.getAgentIdByAudioId(audioId);
         if (StringUtils.isBlank(agentId)) {
@@ -148,7 +139,6 @@ public class AgentController {
     @PostMapping("/chat-summary/{sessionId}/save")
     @Operation(summary = "根据会话ID生成聊天记录总结并保存（异步执行）")
     public Result<Void> generateAndSaveChatSummary(@PathVariable String sessionId) {
-        requireSessionAgent(sessionId);
         try {
             // 异步执行总结生成任务，立即返回成功响应
             new Thread(() -> {
@@ -170,7 +160,7 @@ public class AgentController {
     @PostMapping("/chat-title/{sessionId}/generate")
     @Operation(summary = "根据会话ID生成聊天标题")
     public Result<Void> generateAndSaveChatTitle(@PathVariable String sessionId) {
-        requireSessionAgent(sessionId);
+        // 不在此处预检会话->智能体映射：空会话(无聊天记录)由 service 层优雅跳过，避免把正常空会话当成"智能体未找到"错误
         agentChatSummaryService.generateAndSaveChatTitle(sessionId);
         return new Result<Void>().ok(null);
     }
