@@ -199,11 +199,14 @@ export class WebSocketHandler {
 
             // 句子结束时不清除动画，等待下一个句子或最终停止
         } else if (message.state === 'stop') {
-            log('服务器语音传输结束，清空所有音频缓冲', 'info');
+            log('服务器语音传输结束，延迟清空音频缓冲', 'info');
 
-            // 清空所有音频缓冲并停止播放
+            // 延迟清空音频缓冲，确保已接收的音频有足够时间缓冲并播放完毕。
+            // 立即 clearAllAudio 会在音频尚未播完时把缓冲清空，导致设备无声/播放被截断。
             const audioPlayer = getAudioPlayer();
-            audioPlayer.clearAllAudio();
+            setTimeout(() => {
+                audioPlayer.clearAllAudio();
+            }, 1500);
 
             this.isRemoteSpeaking = false;
             if (this.onRecordButtonStateChange) {

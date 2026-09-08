@@ -185,6 +185,17 @@ export class AudioPlayer {
         try {
             this.audioContext = this.getAudioContext();
 
+            // 浏览器 Autoplay 政策可能导致 AudioContext 处于 suspended 状态，
+            // 此时播放器播放无声。收到音频要播放时主动恢复。
+            if (this.audioContext.state === 'suspended') {
+                log('AudioContext 处于 suspended，尝试恢复播放', 'info');
+                try {
+                    await this.audioContext.resume();
+                } catch (e) {
+                    log('AudioContext 恢复失败: ' + e.message, 'error');
+                }
+            }
+
             if (!this.opusDecoder) {
                 log('初始化Opus解码器...', 'info');
                 try {

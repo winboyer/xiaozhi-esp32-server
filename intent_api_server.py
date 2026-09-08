@@ -29,7 +29,7 @@ import re
 import sys
 import time
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
 
@@ -54,6 +54,29 @@ LLM_MODEL = os.environ.get("LLM_MODEL", "deepseek-v4-flash")
 LLM_MAX_RETRIES = int(os.environ.get("LLM_MAX_RETRIES", "2"))
 LLM_RETRY_BACKOFF_SECONDS = float(os.environ.get("LLM_RETRY_BACKOFF_SECONDS", "0.8"))
 LLM_RETRY_STATUS_CODES = {408, 429, 500, 502, 503, 504}
+
+# 塔机历史作业接口：名称由业务侧提供，SN 用于调用第三方服务。
+TOWER_CRANE_WORK_CYCLE_URL = os.environ.get(
+    "TOWER_CRANE_WORK_CYCLE_URL",
+    "https://tciccs.cscec3bxjy.cn:30400/api/towercranedataservice/getWorkCycleInfoHis",
+)
+TOWER_CRANE_NAME_TO_SN = {
+    "向阳村4#塔机": "91320506MAE18ATB9XTC202606181EW4",
+    "向阳村3#塔机": "91320506MAE18ATB9XTC202606181EW3",
+    "向阳村2#塔机": "91320506MAE18ATB9XTC202606181EW2",
+}
+TOWER_CRANE_REQUEST_VERIFY_TLS = os.environ.get(
+    "TOWER_CRANE_REQUEST_VERIFY_TLS", "false"
+).lower() == "true"
+TOWER_CRANE_REQUEST_TIMEOUT = int(
+    os.environ.get("TOWER_CRANE_REQUEST_TIMEOUT", "30")
+)
+
+# 闸孔开度方案：仅用于计算和论证，不直接控制闸门。
+GATE_PLAN_GRAVITY = 9.81
+GATE_PLAN_KEYWORDS = (
+    "开度方案", "闸门开度", "闸孔开度", "兴各庄闸", "泄洪方案", "闸门调度方案",
+)
 
 # SQL 文件路径
 SQL_FILEPATH = os.environ.get(
@@ -548,6 +571,314 @@ def _parse_time_to_ts(time_str: str) -> Optional[int]:
     return None
 
 
+def calculate_gate_opening_scenarios(
+    target_flow: Optional[float], flow_coefficient: Optional[float] = None,
+    gate_width: Optional[float] = None, head: Optional[float] = None,
+    gate_height: Optional[float] = None, minimum_opening: float = 0.0,
+    flood_flow: Optional[float] = None,
+) -> dict:
+    """计算精确参数方案，或生成兴各庄闸的工程估算方案。"""
+    # 目标流量已知但水头等率定参数未知时，使用规格书结构参数和明确标注的估算假设。
+    if target_flow is not None and any(
+        value is None for value in (flow_coefficient, gate_width, head, gate_height)
+    ):
+        if target_flow <= 0:
+            return {"mode": "estimate", "error": "目标流量Q必须大于0"}
+        gate_count = 9
+        estimate_gate_width = 35.0
+        estimate_gate_height = 5.0
+        estimate_coefficient = 0.65
+        head_range = (0.6, 1.0)
+        opening_values = tuple(
+            round(
+                target_flow / gate_count
+                / (estimate_coefficient * estimate_gate_width
+                   * (2 * GATE_PLAN_GRAVITY * h) ** 0.5),
+                3,
+            )
+            for h in head_range
+        )
+        opening_range = (min(opening_values), max(opening_values))
+        recommended_opening = 0.38
+        return {
+            "mode": "estimate",
+            "formula": "Q=μ·b·e·√(2gH)",
+            "assumptions": {
+                "site": "潮白河兴各庄闸",
+                "gate_count": gate_count,
+                "gate_width": estimate_gate_width,
+                "gate_height": estimate_gate_height,
+                "flow_coefficient": estimate_coefficient,
+                "head_range": head_range,
+                "opening_definition": "等效过水高度，不等同于液压缸行程或底轴转角",
+            },
+            "parameters": {
+                "target_flow": target_flow,
+                "gate_count": gate_count,
+                "gate_width": estimate_gate_width,
+                "gate_height": estimate_gate_height,
+                "flow_coefficient": estimate_coefficient,
+                "head_range": head_range,
+            },
+            "recommended": {
+                "gate_count": gate_count,
+                "per_gate_flow": round(target_flow / gate_count, 2),
+                "equivalent_opening": recommended_opening,
+                "opening_range": opening_range,
+                "opening_at_heads": opening_values,
+                "opening_percent": round(recommended_opening / estimate_gate_height * 100, 1),
+            },
+            "scenarios": {
+                "保守起调": {"gate_count": 9, "opening": 0.30, "flow_range": "约240～300 m³/s（随水头变化）"},
+                "初始推荐": {"gate_count": 9, "opening": 0.38, "flow_range": "约300～380 m³/s（随水头变化）"},
+                "增流档位": {"gate_count": 9, "opening": 0.50, "flow_range": "约400～500 m³/s（随水头变化）"},
+                "7孔备用": {"gate_count": 7, "opening": "约0.50～0.60", "flow_range": "需复核"},
+                "5孔备用": {"gate_count": 5, "opening": "约0.70～0.85", "flow_range": "需复核"},
+            },
+        }
+    required = {"目标流量Q": target_flow, "流量系数μ": flow_coefficient,
+                "闸孔宽度b": gate_width, "有效水头H": head,
+                "最大开度e_max": gate_height}
+    missing = [name for name, value in required.items() if value is None]
+    if missing:
+        return {"formula": "Q=μ·b·e·√(2gH)", "missing_parameters": missing}
+    if any(value <= 0 for value in (flow_coefficient, gate_width, head, gate_height)):
+        return {"formula": "Q=μ·b·e·√(2gH)", "error": "μ、b、H、最大开度必须大于0"}
+    if target_flow <= 0:
+        return {"formula": "Q=μ·b·e·√(2gH)", "error": "目标流量Q必须大于0"}
+    if minimum_opening < 0 or minimum_opening > gate_height:
+        return {"formula": "Q=μ·b·e·√(2gH)", "error": "最小开度必须位于0和最大开度之间"}
+
+    denominator = flow_coefficient * gate_width * (2 * GATE_PLAN_GRAVITY * head) ** 0.5
+    scenario_flows = {"保守": target_flow * 0.7, "目标": target_flow,
+                      "泄洪": flood_flow if flood_flow is not None else target_flow * 1.3}
+    scenario_reasons = {
+        "保守": "按目标流量的70%控制，降低过流量和运行风险",
+        "目标": "按目标流量的100%控制，用于满足常规调度目标",
+        "泄洪": "按指定泄洪流量或目标流量的130%控制，用于提高泄流能力",
+    }
+    scenarios = {}
+    for name, flow in scenario_flows.items():
+        calculated_opening = flow / denominator
+        opening = max(minimum_opening, calculated_opening)
+        scenarios[name] = {"flow": round(flow, 4),
+                           "calculated_opening": round(calculated_opening, 4),
+                           "opening": round(opening, 4),
+                           "opening_percent": round(opening / gate_height * 100, 2),
+                           "within_limit": opening <= gate_height,
+                           "reason": scenario_reasons[name]}
+    return {
+        "mode": "calculated",
+        "formula": "Q=μ·b·e·√(2gH)",
+        "parameters": {"target_flow": target_flow, "flow_coefficient": flow_coefficient,
+                       "gate_width": gate_width, "head": head, "gate_height": gate_height,
+                       "minimum_opening": minimum_opening},
+        "derivation": {
+            "gravity": GATE_PLAN_GRAVITY,
+            "denominator": round(denominator, 6),
+            "opening_equation": "e=Q/(μ·b·√(2gH))",
+            "limit_rule": "e=max(最小开度, 计算开度)，且不得超过最大开度",
+        },
+        "scenarios": scenarios,
+        "calibration": "建议用实测流量反算μ：μ=Q/(b·e·√(2gH))，再按多组实测数据校准。",
+    }
+
+
+def extract_gate_plan_parameters(text: str) -> dict:
+    """从自然语言提取闸门方案参数，支持“过流300m³/s”等常用表达。"""
+    text = text or ""
+
+    def number(patterns):
+        for pattern in patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                return float(match.group(1))
+        return None
+
+    return {
+        "target_flow": number([
+            r"(?:目标流量|过闸流量|过流|流量Q|流量|Q)\s*[:：=]?\s*(\d+(?:\.\d+)?)\s*(?:m³/?s|m3/?s|立方米/?秒)?",
+        ]),
+        "flow_coefficient": number([r"(?:流量系数|系数|μ|u)\s*[:：=]?\s*(\d+(?:\.\d+)?)"]),
+        "gate_width": number([r"(?:闸孔宽度|闸宽|单孔宽度|宽度|b)\s*[:：=]?\s*(\d+(?:\.\d+)?)"]),
+        "head": number([r"(?:有效水头|水头|落差|H)\s*[:：=]?\s*(\d+(?:\.\d+)?)"]),
+        "gate_height": number([r"(?:最大开度|闸高|闸门高度|最大高度|e_max)\s*[:：=]?\s*(\d+(?:\.\d+)?)"]),
+        "minimum_opening": number([r"(?:最小开度|下限)\s*[:：=]?\s*(\d+(?:\.\d+)?)"]) or 0.0,
+        "flood_flow": number([r"(?:泄洪流量|洪峰流量)\s*[:：=]?\s*(\d+(?:\.\d+)?)"]),
+    }
+
+
+def is_gate_opening_plan_query(text: str) -> bool:
+    """识别兴各庄闸开度或调度方案请求，优先于普通 LLM 意图分类。"""
+    normalized = (text or "").lower()
+    return any(keyword.lower() in normalized for keyword in GATE_PLAN_KEYWORDS)
+
+
+def build_gate_dispatch_monitoring_context(engine: "DataQueryEngine") -> dict:
+    """提取最新水位和流量记录，并明确其与兴各庄闸的匹配范围。"""
+    records = []
+    for table_name, fields in (
+        ("flow_radar_level", ("L", "RV", "SSP")),
+        ("flow_array_radar", ("Q_inst", "V_avg", "ar_water_level")),
+        ("flow_tof_meter", ("Q_inst", "V_avg")),
+    ):
+        if table_name not in engine.tables:
+            continue
+        rows = engine.query_table(table_name)
+        if not rows:
+            continue
+        latest = max(rows, key=lambda row: row.get("dt") or 0)
+        values = {
+            field: latest.get(field)
+            for field in fields
+            if latest.get(field) is not None
+        }
+        if values:
+            records.append({
+                "table": table_name,
+                "device_name": latest.get("equip_name") or "未命名设备",
+                "install_address": latest.get("install_addr") or "未标注位置",
+                "timestamp": latest.get("time") or latest.get("dt"),
+                "values": values,
+            })
+
+    has_xinggezhuang = any(
+        "兴各庄" in f"{record['device_name']}{record['install_address']}"
+        for record in records
+    )
+    missing = ["9孔当前开度", "闸门设备状态", "厂家泄流曲线或现场率定参数"]
+    if not has_xinggezhuang:
+        missing.insert(0, "兴各庄闸上游/下游明确点位水位")
+    return {
+        "data_scope": "xinggezhuang_monitoring_data" if has_xinggezhuang else "generic_monitoring_data",
+        "latest_records": records,
+        "missing_data": missing,
+    }
+
+
+def build_llm_gate_dispatch_prompt(
+    user_query: str, parameters: dict, monitoring_context: dict,
+) -> tuple[str, str]:
+    """构造每次均调用大模型的闸门调度分析提示词。"""
+    system_prompt = """你是潮白河兴各庄闸的水利工程调度辅助分析师。每次必须基于用户问题、规格书确认参数和提供的监测上下文重新分析，禁止套用固定答案。
+
+兴各庄闸已确认固定参数：9孔翻板式平面钢闸门；单孔净宽35m；闸门高度5m；闸底板顶高程9.00m。闸门调度只输出辅助建议，不得下发控制指令。
+
+必须严格使用并原样保留以下七个标题：
+【1、已知条件和数据】
+【2、推荐的估算方案】
+【3、估算推理过程】
+【4、建议采用的开度估算档位】
+【5、优先推荐方案的原因】
+【6、现场调度步骤】
+【7、最终估算结论】
+
+核心原则：当监测上下文中缺少必要数据（水位、流量系数等）时，可以给出合理假定值用于估算，但必须明确标注为"假定"而非真实数据。这是辅助分析，所有数字都可能需要现场复核。
+
+规则（按重要性排序）：
+1. 数据来源必须三分类并原样标注：①【规格书参数】=规格书中已确认的固定值；②【实时监测】=监测上下文中明确给出的最新读数；③【估算假定】=因数据缺失而由模型给出的合理默认值。每一条数值在【1、已知条件和数据】中必须标明属于哪一类。
+2. 缺少上游/下游明确点位水位时，可假定一个合理值（如基于闸底板高程9.00m推算），但必须在【1、已知条件和数据】中标注"【估算假定】上游水位=X.XXm（模型根据闸底板高程推定，需现场确认）"。同理，缺少流量系数时可假定μ=0.65～0.75，也必须标注为假定。
+3. data_scope=generic_monitoring_data 时，监测记录仅为通用示例数据，绝不能称为兴各庄闸实时数据，必须在第1节显著注明。
+4. 不得虚构某一孔的"实际开度""当前状态"（如"3号孔已开启"）。可以给出候选开度范围和公式推理。
+5. 缺少9孔当前开度、闸门设备状态、泄流率定曲线时，必须在第1节和第7节说明缺失项及其对方案置信度的影响。
+6. 绝不能说"直接执行""自动开启""已验证安全""已核实"等肯定性措辞；必须使用"建议""辅助分析""需人工复核"。
+7. 结论必须随本次用户目标流量和监测上下文变化，不要输出与本次数据无关的固定表述。
+8. 若用户输入中包含目标流量，可以基于假定值完成水力公式估算并给出推荐方案（孔数、开度范围、经验系数），但必须在每处使用假定值的地方标注"【估算假定】"。"""
+    user_prompt = (
+        f"用户问题：{user_query}\n"
+        f"解析参数：{json.dumps(parameters, ensure_ascii=False)}\n"
+        f"监测上下文：{json.dumps(monitoring_context, ensure_ascii=False)}\n"
+        "请生成完整七段式闸门调度辅助分析。"
+    )
+    return system_prompt, user_prompt
+
+
+def format_gate_opening_analysis_process(calculation: dict) -> str:
+    """格式化开度方案；估算模式固定输出七个业务段落。"""
+    if calculation.get("mode") == "estimate":
+        return _format_estimated_gate_plan(calculation)
+    lines = ["【分析过程】", f"采用公式：{calculation['formula']}"]
+    missing = calculation.get("missing_parameters")
+    if missing:
+        lines.append("缺少必要参数：" + "、".join(missing))
+        lines.append("因此暂不计算具体开度，补齐参数后再生成方案。")
+        return "\n".join(lines)
+    if calculation.get("error"):
+        lines.append("参数校验失败：" + calculation["error"])
+        return "\n".join(lines)
+
+    params = calculation["parameters"]
+    derivation = calculation["derivation"]
+    lines.append(
+        "参数：Q目标={target_flow}，μ={flow_coefficient}，b={gate_width}，"
+        "H={head}，最大开度={gate_height}，最小开度={minimum_opening}".format(**params)
+    )
+    lines.append(
+        "代入：e=Q/(μ·b·√(2gH))，分母={denominator}，g={gravity}".format(**derivation)
+    )
+    lines.append("限幅规则：" + derivation["limit_rule"])
+    for name, scenario in calculation["scenarios"].items():
+        limit_note = "未超过最大开度" if scenario["within_limit"] else "超过最大开度，不能直接采用"
+        lines.append(
+            f"{name}：Q={scenario['flow']}，理论e={scenario['calculated_opening']}，"
+            f"建议e={scenario['opening']}（{scenario['opening_percent']}%），{limit_note}。"
+        )
+    lines.append("校验：" + calculation["calibration"])
+    return "\n".join(lines)
+
+
+def _format_estimated_gate_plan(calculation: dict) -> str:
+    """输出透明的工程估算方案，明确假设、范围和人工复核边界。"""
+    params = calculation["parameters"]
+    recommended = calculation["recommended"]
+    assumptions = calculation["assumptions"]
+    lines = [
+        "【1、已知条件和数据】",
+        f"工程对象：{assumptions['site']}；工作闸门为翻板式平面钢闸门，共{params['gate_count']}孔，单孔净宽{params['gate_width']}m，闸门高度{params['gate_height']}m。",
+        f"目标过闸流量：{params['target_flow']}m³/s；总过流宽度={params['gate_count']}×{params['gate_width']}={params['gate_count'] * params['gate_width']:.0f}m。",
+        "规格书同时配置上下游水位、流量监测、视频测流和PLC开度调节，可用于后续现场率定。",
+        "当前未提供实测上下游水位和厂家泄流曲线，以下为估算方案，不作为直接控制指令。",
+        "",
+        "【2、推荐的估算方案】",
+        f"优先采用{recommended['gate_count']}孔全部参与过流、左右对称、基本等开度运行；单孔目标流量约{recommended['per_gate_flow']}m³/s。",
+        f"按有效水头{params['head_range'][0]}～{params['head_range'][1]}m、流量系数μ={params['flow_coefficient']}估算，单孔等效过水高度约{recommended['opening_range'][0]}～{recommended['opening_range'][1]}m，建议以{recommended['equivalent_opening']:.2f}m作为初始计算点。",
+        "等效过水高度不等同于液压缸行程、底轴转角或门顶高程，实际控制量需按闸门几何关系换算。",
+        "",
+        "【3、估算推理过程】",
+        "采用闸孔出流估算公式：Q=μ·b·e·√(2gH)。其中Q为总流量，μ为流量系数，b为单孔净宽，e为等效过水高度，H为有效水头。",
+        f"先按均匀分配计算单孔流量：Q单=Q总/{params['gate_count']}={recommended['per_gate_flow']}m³/s；再按 e=Q单/(μ·b·√(2gH)) 反算开度。",
+        f"当H={params['head_range'][0]}m时，e约{recommended['opening_at_heads'][0]}m；当H={params['head_range'][1]}m时，e约{recommended['opening_at_heads'][1]}m。考虑局部损失、收缩、下游顶托和测量误差，将约{recommended['opening_range'][0]}～{recommended['opening_range'][1]}m作为工程估算范围。",
+        "",
+        "【4、建议采用的开度估算档位】",
+        "保守起调：9孔，单孔等效开度约0.30m，预计约240～300m³/s；初始推荐：9孔，约0.38m，预计约300～380m³/s；增流档位：9孔，约0.50m，预计约400～500m³/s。以上流量随有效水头变化，仅作档位估算。",
+        "备用方案：7孔对称开启时约0.50～0.60m，5孔中部对称开启时约0.70～0.85m，均需重点复核流态、消能和冲刷。",
+        "",
+        "【5、优先推荐方案的原因】",
+        "9孔等开度方案可使单孔流量较小且横向分布均匀，有利于降低局部高速射流、偏流、闸墩附近水力冲击和下游河床局部冲刷风险，也便于液压系统同步控制和通过实测流量闭环修正。",
+        "少孔大开度仅作为检修、设备故障或调节灵敏度不足时的备用方案，不建议在缺少泄流曲线和消能校核时作为首选。",
+        "",
+        "【6、现场调度步骤】",
+        "1. 核对上下游水位、来水流量、下游河道及消能条件，确认设备无故障。\n2. 9孔同步小幅开启，初始按约0.30m等效开度估算。\n3. 等待水位、流量和闸门状态稳定，检查开度反馈、液压站压力、振动、异响、下游流态和冲刷。\n4. 若流量不足，每次整体增加约0.05m，按0.35→0.40→0.45m逐级调整。\n5. 接近300m³/s后，以实测流量为主进行微调，不通过单孔大幅开度补偿。\n6. 任何异常或上下游水位明显变化时暂停调整，重新计算有效水头并由运行人员复核。",
+        "",
+        "【7、最终估算结论】",
+        f"针对{params['target_flow']}m³/s目标流量，推荐9孔全部参与过流，单孔约{recommended['per_gate_flow']}m³/s，以约{recommended['equivalent_opening']:.2f}m等效过水高度作为初始估算点，合理估算范围约{recommended['opening_range'][0]}～{recommended['opening_range'][1]}m。该结果仅用于方案比选、算法原型和现场试调初值；正式运行前必须结合实测上下游水位、厂家泄流曲线或现场率定结果，并经有权限的水闸运行人员确认。",
+    ]
+    return "\n".join(lines)
+
+
+def build_gate_opening_plan_prompt(user_query: str, calculation: dict) -> str:
+    """构造开度方案 LLM 提示，限制其只能解释计算结果。"""
+    return (
+        "你是潮白河项目水闸运行方案分析师。根据闸孔出流公式 "
+        "Q=μ·b·e·√(2gH) 审核并整理开度建议。只能使用用户参数和计算结果，"
+        "不得臆造现场数据，不得声称已完成实际安全验证，不得下发控制指令。"
+        "程序会单独展示确定性的计算过程。你只需补充三种方案的业务原因、"
+        "风险、适用场景、假设和实测反算μ的校验建议；不要重复编造计算步骤，"
+        "不要输出无法核验的内部思维链。明确标注‘建议值，需人工复核’。"
+        f"\n用户问题：{user_query}\n计算结果：{json.dumps(calculation, ensure_ascii=False)}"
+    )
+
+
 # ==================== LLM 调用 ====================
 
 # ==================== LLM HTTP 客户端（连接池复用） ====================
@@ -710,7 +1041,9 @@ def call_llm_stream(
         ],
         "temperature": temperature,
         "max_tokens": max_tokens,
+        "thinking": {"type": "disabled"},
         "stream": True,
+        "thinking": {"type": "disabled"},
     }
 
     logger.info(f"调用 LLM (stream): {LLM_MODEL}")
@@ -730,13 +1063,13 @@ def call_llm_stream(
             try:
                 chunk = json.loads(data_str)
                 delta = chunk["choices"][0].get("delta", {})
-                content = delta.get("content", "")
-                if content:
+                text = delta.get("content", "")
+                if text and text.strip():
                     if first_token:
                         ttft = time.time() - start
                         logger.info(f"LLM 首 token 耗时: {ttft:.2f}s")
                         first_token = False
-                    yield content
+                    yield text
             except (json.JSONDecodeError, KeyError, IndexError):
                 continue
 
@@ -753,6 +1086,7 @@ def call_llm_sync(
     temperature: float = 0,
     max_tokens: int = 200,
     response_format: Optional[dict] = None,
+    timeout: int = 30,
 ) -> str:
     """
     同步调用 LLM API（非流式），用于意图分类等短响应场景。
@@ -766,20 +1100,28 @@ def call_llm_sync(
         ],
         "temperature": temperature,
         "max_tokens": max_tokens,
+        "thinking": {"type": "disabled"},
     }
     if response_format:
         payload["response_format"] = response_format
 
     logger.info(f"调用 LLM (sync): {LLM_MODEL}")
     start = time.time()
-    resp = _post_llm_with_retry(payload, stream=False, timeout=30)
+    resp = _post_llm_with_retry(payload, stream=False, timeout=timeout)
 
     elapsed = time.time() - start
     logger.info(f"LLM sync 完成, 耗时: {elapsed:.2f}s, status={resp.status_code}")
     try:
         data = resp.json()
-        return data["choices"][0]["message"]["content"]
+        message = data["choices"][0]["message"]
+        content = (message.get("content") or "").strip()
+        if not content:
+            logger.warning(f"LLM sync 返回空 content，完整 message keys: {list(message.keys())}")
+            raise RuntimeError("LLM未生成可展示文本")
+        return content
     except Exception as e:
+        if isinstance(e, RuntimeError):
+            raise
         raise RuntimeError(f"LLM API 响应解析失败: {e}") from e
 
 
@@ -973,12 +1315,100 @@ def _normalize_table_list(raw_tables, engine: "DataQueryEngine") -> list:
     return normalized
 
 
+# 字段中文名映射（用于统计摘要）
+FIELD_CN_NAMES = {
+    "sf_crack_width": "裂缝宽度(mm)", "sf_temp": "温度(℃)",
+    "gnss_horizontal_dis_n": "水平位移N(mm)", "gnss_horizontal_dis_e": "水平位移E(mm)", "gnss_vertical_dis": "垂直位移(mm)",
+    "pz_pressure": "渗压(kPa)", "pz_temp": "温度(℃)", "pz_depth": "埋深(m)",
+    "sp_pressure": "土压力(kPa)", "sp_temp": "温度(℃)", "sp_depth": "埋深(m)",
+    "Q_inst": "瞬时流量(m³/s)", "Q_total": "累积流量(m³)", "V_avg": "平均流速(m/s)", "ar_water_level": "水位(m)",
+    "L": "液位(m)", "E": "电量(%)",
+    "st": "状态", "EV": "电压(V)",
+    "hrz_dis_n": "水平位移N(mm)", "hrz_dis_e": "水平位移E(mm)", "vrt_dis": "垂直位移(mm)",
+}
+
+
+def _cn_field(fname: str) -> str:
+    """返回字段的中文名，无映射时返回原名"""
+    return FIELD_CN_NAMES.get(fname, fname)
+
+
 # ==================== 第2次 LLM 调用：简要总结 ====================
 
 SUMMARY_BRIEF_PROMPT = (
-    "你是工程监测数据分析师。根据数据统计给出核心报告。"
-    "要求：≤200字，直接列关键数值和简要判断，有异常才指出。不要标题、不用markdown。"
+    "你是监控数据总结器。严格只输出最终结论，不要任何推理、分析、解释、前缀、模板、示例或多句描述。"
+    "直接输出 1 句简洁结论，长度尽量控制在 30~50 字。"
 )
+
+
+def _strip_reasoning(text: str) -> str:
+    """去除 LLM 输出中的推理前缀、元指令和多余解释，只保留最终结论。"""
+    if not text:
+        return ""
+
+    text = text.strip()
+    text = re.sub(r"^```(?:json|text)?\s*", "", text)
+    text = re.sub(r"\s*```$", "", text)
+    text = text.replace("\u200b", "").strip()
+
+    # 去掉常见的前缀提示和标签
+    text = re.sub(r"^(分析|总结|结论|结果|回答|报告|说明|判断|简要结论)[:：]\s*", "", text)
+    text = re.sub(r"^[^：:。！？\n]*[：:]\s*", "", text)
+
+    # 迭代剥离，直到没有更多匹配（处理多层嵌套推理）
+    reasoning_starts = [
+        r'^我们(被问到|根据|分析|需要|被要求|来看|可以)[^。！？\n]*[。！？]?\s*',
+        r'^根据(提供|数据|用户)[^。！？\n]*[。！？]?\s*',
+        r'^(按照|格式|注意|提示|示例)[^。！？\n]*[。！？]?\s*',
+        r'^(用户|问题)[^。！？\n]*(问的是|涉及)[^。！？\n]*[。！？]?\s*',
+        r'^(直接给出最终答案|禁止推理过程|禁止分析步骤|禁止"我们"开头|只输出最终结论|只输出 1 句简洁结论)[^。！？\n]*[。！？]?\s*',
+        r'^(需要根据|需要基于|先|接着|然后|最后)[^。！？\n]*[。！？]?\s*',
+        r'^(我先|我们先|我会|我们会|我建议|我们建议)[^。！？\n]*[。！？]?\s*',
+    ]
+    changed = True
+    while changed:
+        changed = False
+        for pat in reasoning_starts:
+            new_text = re.sub(pat, '', text)
+            if new_text != text and len(new_text) > 15:
+                text = new_text
+                changed = True
+                break
+
+    # 去掉尾部的客套/追问内容
+    text = re.sub(r'(?:\s*(请问|还有什么|还有|如需|如果需要|欢迎|谢谢|可以继续).*)$', '', text)
+
+    # 去掉引用用户问题的部分（"原文..."、引号包裹的问题重复）
+    text = re.sub(r'^["\u201c\u201d](.+?)["\u201c\u201d]\s*[，,]?\s*', '', text)
+    text = re.sub(r"^['\u2018\u2019](.+?)['\u2018\u2019]\s*[，,]?\s*", '', text)
+
+    # 如果仍然有推理痕迹，尝试提取最后一句结论
+    # 常见的推理标记："所以"、"因此"、"综上"、"结论是"、"最终"、"输出"
+    concluding_markers = [
+        r'(?:所以|因此|综上|综上所[述说]|结论[是为]|最终|输出一句话结论)[：:]?\s*([^。！？\n，,]+[。！？]?)',
+    ]
+    for pat in concluding_markers:
+        m = re.search(pat, text)
+        if m:
+            candidate = m.group(1).strip()
+            if len(candidate) >= 5:
+                text = candidate
+                break
+
+    # 兜底：尝试提取引号内的结论内容（"xxx" / “xxx” / 'xxx' / ‘xxx’）
+    if len(text) > 50 or any(kw in text for kw in ["直接输出", "不要", "禁止", "只输出"]):
+        # 优先取最后一对引号的内容（左右引号成对匹配，避免单字符索引越界）
+        for qm in ['""', '“”', "''", '‘’']:
+            quoted = re.findall(rf'{re.escape(qm[0])}([^{re.escape(qm[1])}]+?){re.escape(qm[1])}', text)
+            for part in reversed(quoted):
+                part = part.strip()
+                if re.search(r'\d', part) and len(part) >= 4:
+                    text = part
+                    break
+            if len(text) <= 50:
+                break
+
+    return text.strip(" \t\r\n：:;；")
 
 
 def extract_relevant_stats(tables: list, matched_fields: list, engine: DataQueryEngine) -> str:
@@ -1003,7 +1433,8 @@ def extract_relevant_stats(tables: list, matched_fields: list, engine: DataQuery
         parts = []
         for fname in fields_to_report:
             fs = all_stats[fname]
-            parts.append(f"{fname}={fs['min']}~{fs['max']}(avg:{fs['avg']})")
+            cn = _cn_field(fname)
+            parts.append(f"{cn}={fs['min']}~{fs['max']}(均值{fs['avg']})")
         lines.append(f"{tname}({cn}): {'; '.join(parts)}")
     return "\n".join(lines) if lines else "无匹配数据"
 
@@ -1013,14 +1444,22 @@ def summarize_stream(user_query: str, tables: list, matched_fields: list, engine
     第2次 LLM 调用：根据 LLM 选表 + 代码选字段，流式生成简要总结。
     """
     stats_text = extract_relevant_stats(tables, matched_fields, engine)
-    user_message = f"数据:\n{stats_text}\n\n用户问: {user_query}\n简要报告:"
+    user_message = f"数据:\n{stats_text}\n\n问题: {user_query}\n直接输出："
     try:
-        yield from call_llm_stream(
+        raw = []
+        for token in call_llm_stream(
             system_prompt=SUMMARY_BRIEF_PROMPT,
             user_message=user_message,
             temperature=0,
-            max_tokens=300,
-        )
+            max_tokens=150,
+        ):
+            raw.append(token)
+        full = _strip_reasoning("".join(raw))
+        if not full:
+            full = _build_stats_fallback_summary(user_query, tables, matched_fields, engine)
+        raw_text = "".join(raw)
+        logger.info(f"LLM 总结原始: {raw_text[:100]}, 清洗后: {full[:100]}")
+        yield full
     except Exception as e:
         logger.warning(f"LLM 总结失败，使用本地统计降级: {e}")
         yield _build_stats_fallback_summary(user_query, tables, matched_fields, engine)
@@ -1198,6 +1637,82 @@ def web_search(query: str) -> dict:
     }
 
 
+# ==================== 塔机作业状态查询 ====================
+
+def _resolve_tower_crane_name(value: str) -> tuple[str, str]:
+    """按塔机名称解析 deviceSN，支持自然语言中的名称片段。"""
+    text = re.sub(r"\s+", "", str(value or ""))
+    if text in TOWER_CRANE_NAME_TO_SN:
+        return text, TOWER_CRANE_NAME_TO_SN[text]
+    for name, device_sn in TOWER_CRANE_NAME_TO_SN.items():
+        if name in text or text in name:
+            return name, device_sn
+    raise ValueError(
+        "未找到塔机名称，请使用：" + "、".join(TOWER_CRANE_NAME_TO_SN)
+    )
+
+
+def _validate_tower_crane_time(value: str, field_name: str) -> str:
+    """校验第三方接口要求的时间格式，允许日终 24:00:00。"""
+    if not isinstance(value, str) or not re.fullmatch(
+        r"\d{4}-\d{2}-\d{2} (?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d|\d{4}-\d{2}-\d{2} 24:00:00",
+        value,
+    ):
+        raise ValueError(f"{field_name} 必须使用 YYYY-MM-DD HH:MM:SS 格式")
+    return value
+
+
+def _default_tower_crane_time_range() -> tuple[str, str]:
+    """默认查询最近 24 小时，避免查询范围无限扩大。"""
+    end = datetime.now()
+    start = end - timedelta(days=1)
+    return start.strftime("%Y-%m-%d %H:%M:%S"), end.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def query_tower_crane_work_status(
+    device_name: str, start_time: Optional[str] = None, end_time: Optional[str] = None,
+) -> dict:
+    """查询指定塔机的历史作业记录并生成状态摘要。"""
+    resolved_name, device_sn = _resolve_tower_crane_name(device_name)
+    default_start, default_end = _default_tower_crane_time_range()
+    start_time = _validate_tower_crane_time(start_time or default_start, "startTime")
+    end_time = _validate_tower_crane_time(end_time or default_end, "endTime")
+
+    try:
+        response = requests.post(
+            TOWER_CRANE_WORK_CYCLE_URL,
+            json={"deviceSN": device_sn, "startTime": start_time, "endTime": end_time},
+            headers={"Accept": "application/json", "Content-Type": "application/json"},
+            timeout=TOWER_CRANE_REQUEST_TIMEOUT,
+            verify=TOWER_CRANE_REQUEST_VERIFY_TLS,
+        )
+    except requests.RequestException as exc:
+        raise RuntimeError(f"塔机数据接口请求失败: {exc}") from exc
+
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise RuntimeError(f"塔机数据接口返回非 JSON（HTTP {response.status_code}）") from exc
+
+    if response.status_code != 200 or not payload.get("success"):
+        message = payload.get("msg") or f"HTTP {response.status_code}"
+        raise RuntimeError(f"塔机数据接口查询失败: {message}")
+
+    cycles = payload.get("data") or []
+    if not isinstance(cycles, list):
+        raise RuntimeError("塔机数据接口返回的 data 不是数组")
+    latest = max(cycles, key=lambda item: item.get("endTime") or item.get("startTime") or "") if cycles else None
+    return {
+        "device_name": resolved_name,
+        "device_sn": device_sn,
+        "start_time": start_time,
+        "end_time": end_time,
+        "status": "有作业记录" if cycles else "查询范围内无作业记录",
+        "work_cycle_count": len(cycles),
+        "latest_cycle": latest,
+    }
+
+
 # ==================== HTTP 请求处理器 ====================
 
 class IntentAPIHandler(BaseHTTPRequestHandler):
@@ -1263,7 +1778,9 @@ class IntentAPIHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         path = self.path.split("?")[0]
 
-        if path == "/api/v1/intent/analyze":
+        if path == "/api/v1/taji/work-status":
+            self._handle_tower_crane_work_status()
+        elif path == "/api/v1/intent/analyze":
             self._handle_analyze()
         else:
             self._send_json({"error": "Not Found"}, 404)
@@ -1277,6 +1794,35 @@ class IntentAPIHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     # ---- 处理方法 ----
+
+    def _handle_tower_crane_work_status(self):
+        """按塔机名称查询历史作业状态，不经过 LLM。"""
+        try:
+            body = self._read_body()
+            device_name = (
+                body.get("device_name")
+                or body.get("deviceName")
+                or body.get("name")
+                or body.get("query")
+            )
+            if not device_name:
+                self._send_json({
+                    "error": "请提供 device_name，例如：向阳村4#塔机",
+                    "available_devices": list(TOWER_CRANE_NAME_TO_SN),
+                }, 400)
+                return
+
+            result = query_tower_crane_work_status(
+                device_name=device_name,
+                start_time=body.get("startTime") or body.get("start_time"),
+                end_time=body.get("endTime") or body.get("end_time"),
+            )
+            self._send_json({"success": True, "data": result})
+        except ValueError as exc:
+            self._send_json({"success": False, "error": str(exc)}, 400)
+        except RuntimeError as exc:
+            logger.warning(f"塔机作业状态查询失败: {exc}")
+            self._send_json({"success": False, "error": str(exc)}, 502)
 
     def _handle_analyze(self):
         """
@@ -1309,6 +1855,32 @@ class IntentAPIHandler(BaseHTTPRequestHandler):
                 self._stream_weather(user_query, start_time)
                 return
 
+            # ---- 闸门调度方案：确定性估算输出，禁止进入普通 LLM 分类/总结 ----
+            if is_gate_opening_plan_query(user_query):
+                params = extract_gate_plan_parameters(user_query)
+                monitoring_context = build_gate_dispatch_monitoring_context(self.engine)
+                system_prompt, llm_prompt = build_llm_gate_dispatch_prompt(
+                    user_query, params, monitoring_context,
+                )
+                try:
+                    summary = call_llm_sync(
+                        system_prompt=system_prompt,
+                        user_message=llm_prompt,
+                        temperature=0.2,
+                        max_tokens=5000,
+                        timeout=120,
+                    ).strip()
+                except Exception as exc:
+                    summary = (
+                        "闸门调度分析服务不可用，未生成模型建议。\n"
+                        f"监测数据范围：{monitoring_context['data_scope']}。\n"
+                        "缺失数据：" + "、".join(monitoring_context["missing_data"]) + "。\n"
+                        "请检查LLM服务和兴各庄闸实时监测接入后重试。"
+                    )
+                    logger.error(f"闸门调度LLM分析失败: {exc}")
+                self._send_sse_done(round(time.time() - start_time, 2), summary)
+                return
+
             # ---- 第1次 LLM：意图分类 ----
             intent = classify_intent(user_query, self.engine)
             if not isinstance(intent, dict):
@@ -1331,7 +1903,12 @@ class IntentAPIHandler(BaseHTTPRequestHandler):
                 return
 
             if not tables:
-                tables = list(self.engine.all_stats.keys())
+                # LLM 分类失败：用关键词匹配兜底，避免全表查询导致上下文过大
+                kw_match = match_intent(user_query, self.engine)
+                tables = kw_match.get("tables", [])
+                if not tables:
+                    tables = list(self.engine.all_stats.keys())
+                logger.info(f"意图分类失败，关键词兜底: tbls={tables}")
 
             # ---- 关键词匹配字段（LLM 不再选字段） ----
             matched_fields = []
@@ -1367,60 +1944,24 @@ class IntentAPIHandler(BaseHTTPRequestHandler):
         full_text = ""
         for token in handle_weather_query(user_query):
             full_text += token
-            try:
-                self.wfile.write(
-                    f"data: {json.dumps({'token': token}, ensure_ascii=False)}\n\n".encode()
-                )
-                self.wfile.flush()
-            except (BrokenPipeError, ConnectionResetError):
-                return
         total_time = round(time.time() - start_time, 2)
         self._send_sse_done(total_time, full_text.strip())
 
     def _stream_joined(self, tables: list, user_query: str, start_time: float):
-        """多表 JOIN 后用同步 LLM 生成总结，再逐步推流"""
-        joined_text = self.engine.get_joined_stats(tables)
-        user_message = f"数据（按位置合并多表）:\n{joined_text}\n\n用户问: {user_query}\n简要报告:"
-        # 用同步调用避免流式偶发的空 token 问题
-        try:
-            summary = call_llm_sync(
-                system_prompt=SUMMARY_BRIEF_PROMPT,
-                user_message=user_message,
-                temperature=0,
-                max_tokens=300,
-            ).strip()
-        except Exception as e:
-            logger.warning(f"JOIN 总结失败，使用本地统计降级: {e}")
-            summary = _build_stats_fallback_summary(user_query, tables, [], self.engine)
-        if not summary:
-            logger.warning(f"JOIN LLM 返回空, prompt_len={len(user_message)}")
-            summary = "数据量较大，请缩小查询范围（如指定具体设备或位置）。"
-        # 逐字推流（模拟 SSE token 效果）
-        for ch in summary:
-            try:
-                self.wfile.write(
-                    f"data: {json.dumps({'token': ch}, ensure_ascii=False)}\n\n".encode()
-                )
-                self.wfile.flush()
-            except (BrokenPipeError, ConnectionResetError):
-                return
+        """多表 JOIN 后用 summarize_stream 生成总结（统一走 _strip_reasoning 后处理）"""
+        summary = ""
+        for piece in summarize_stream(user_query, tables, [], self.engine):
+            summary = piece
         total_time = round(time.time() - start_time, 2)
-        self._send_sse_done(total_time, summary)
+        self._send_sse_done(total_time, summary.strip())
 
     def _stream_single_table(self, user_query: str, table: str, matched_fields: list, start_time: float):
         """单表查询流式输出"""
-        full_text = ""
-        for token in summarize_stream(user_query, [table] if table else [], matched_fields, self.engine):
-            full_text += token
-            try:
-                self.wfile.write(
-                    f"data: {json.dumps({'token': token}, ensure_ascii=False)}\n\n".encode()
-                )
-                self.wfile.flush()
-            except (BrokenPipeError, ConnectionResetError):
-                return
+        summary = ""
+        for piece in summarize_stream(user_query, [table] if table else [], matched_fields, self.engine):
+            summary = piece
         total_time = round(time.time() - start_time, 2)
-        self._send_sse_done(total_time, full_text.strip())
+        self._send_sse_done(total_time, summary.strip())
 
     def _send_sse_done(self, elapsed: float, summary: str = ""):
         """发送 SSE 完成事件"""
@@ -1516,6 +2057,9 @@ async function go() {
     const result = document.getElementById('result');
     const summaryEl = document.getElementById('summary');
     const timeEl = document.getElementById('time');
+    function cleanSummary(text) {
+        return (text || '').replace(/\s+/g, ' ').trim();
+    }
     btn.disabled = true;
     ld.classList.add('active');
     result.style.display = 'none';
@@ -1547,10 +2091,15 @@ async function go() {
                             result.style.display = '';
                             ld.classList.remove('active');
                         }
-                        summaryEl.textContent += data.token;
+                        const cleaned = cleanSummary(data.token);
+                        if (cleaned) {
+                            summaryEl.textContent += cleaned;
+                        }
                     } else if (data.summary !== undefined) {
-                        summaryEl.textContent = data.summary;
-                        timeEl.textContent = '⏱ '+data.elapsed_seconds+'秒';
+                        result.style.display = '';
+                        ld.classList.remove('active');
+                        summaryEl.textContent = cleanSummary(data.summary);
+                        timeEl.textContent = '⏱ ' + data.elapsed_seconds + '秒';
                     } else if (data.error) {
                         summaryEl.innerHTML = '<div class="error">'+data.error+'</div>';
                         result.style.display = '';
